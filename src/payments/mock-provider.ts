@@ -30,7 +30,7 @@ export class MockPaymentProvider implements PaymentProvider {
 
   constructor(options: MockPaymentProviderOptions = {}) {
     this.#latencyMs = options.latencyMs ?? 800;
-    this.#slowLatencyMs = options.slowLatencyMs ?? 6000;
+    this.#slowLatencyMs = options.slowLatencyMs ?? 10_000;
   }
 
   authorize(request: AuthorizeRequest): Promise<AuthorizeResult> {

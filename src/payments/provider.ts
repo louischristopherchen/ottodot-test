@@ -37,7 +37,7 @@ export const TEST_CARDS = {
   pm_card_visa_slow: {
     label: 'Visa ending 1881',
     behaviour: 'approve_slowly',
-    description: 'Approves after a 6 second delay. Use it to race another parent for the last seat.',
+    description: 'Approves after about 10 seconds. Use it to race another parent for the last seat.',
   },
   pm_card_declined: {
     label: 'Visa ending 0002',
