@@ -27,14 +27,15 @@ Error codes and their HTTP status are in `ERROR_STATUS` (`packages/shared/src/co
 
 ### Auth
 
-Access token: JWT (HS256, 30 minutes), sent as `Authorization: Bearer <token>`, kept in memory by the SPA only.
+Access token: JWT (HS256, 30 minutes), sent as `Authorization: Bearer <token>`, kept in memory by the SPA only. It carries its session family; it stays valid while that sign-in has a live session, so a refresh in one tab does not end the others.
 Refresh token: opaque, rotated on every use, in an httpOnly cookie `tb_refresh` (`SameSite=Strict`, `Path=/api/auth`, `Secure` in production). The SPA never reads it.
 
 | Method and path | Body | Success `data` | Errors |
 | --- | --- | --- | --- |
-| `POST /api/auth/login` | `{ email, password }` | `SessionDto` (+ sets cookie) | 400 `VALIDATION_ERROR`, 401 `INVALID_CREDENTIALS`, 429 `ACCOUNT_LOCKED` / `RATE_LIMITED` |
+| `POST /api/auth/login` | `{ email, password }` | `SessionDto` (+ sets cookie) | 400 `VALIDATION_ERROR`, 401 `INVALID_CREDENTIALS`, 429 `RATE_LIMITED` |
 | `POST /api/auth/refresh` | none (cookie) | `SessionDto` (+ rotates cookie) | 401 `UNAUTHORIZED` (cookie cleared) |
 | `POST /api/auth/logout` | none (cookie) | `{ loggedOut: true }` (cookie cleared) | |
+| `POST /api/auth/logout-all` | none (bearer) | `{ loggedOut: true, sessions }`: every sign-in of the user ends | 401 |
 | `GET /api/auth/me` | | `UserDto` | 401 |
 
 SPA flow: on load, call `POST /api/auth/refresh`; 200 means signed in, 401 means show the login page.
@@ -66,10 +67,10 @@ On any 401 with code `TOKEN_EXPIRED` or `UNAUTHORIZED` from another endpoint, re
 ## Environment
 
 `apps/api` (validated by zod in `src/config/env.ts`; see `.env.example`):
-`NODE_ENV`, `PORT` (4001), `BIND_HOST` (127.0.0.1), `DATABASE_URL`, `JWT_SECRET` (32+ chars), `JWT_ACCESS_TTL` (30m), `REFRESH_TTL_DAYS` (7),
+`NODE_ENV`, `PORT` (4001), `BIND_HOST` (127.0.0.1), `DATABASE_URL`, `DB_POOL_MAX` (10), `JWT_SECRET` (32+ chars), `JWT_ACCESS_TTL` (30m), `REFRESH_TTL_DAYS` (7), `SESSION_MAX_AGE_DAYS` (30),
 `CORS_ORIGIN` (comma separated), `COOKIE_SECURE`, `TRUST_PROXY`, `PAYMENT_PROVIDER_URL`, `PAYMENT_PROVIDER_API_KEY`, `PAYMENT_PROVIDER_TIMEOUT_MS`,
-`LOG_LEVEL`, `BCRYPT_COST`, `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `LOGIN_RATE_LIMIT_MAX`, `PAYMENT_RATE_LIMIT_MAX`,
-`UNPAID_BOOKING_TTL_MINUTES`, `WORKER_INTERVAL_MS`, `PAYMENT_JOB_MAX_ATTEMPTS`, `RECONCILE_AFTER_SECONDS`.
+`LOG_LEVEL`, `BCRYPT_COST`, `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `LOGIN_RATE_LIMIT_MAX`, `LOGIN_IP_RATE_LIMIT_MAX`, `LOGIN_EMAIL_RATE_LIMIT_MAX`, `PAYMENT_RATE_LIMIT_MAX`,
+`UNPAID_BOOKING_TTL_MINUTES`, `WORKER_INTERVAL_MS`, `PAYMENT_JOB_ALERT_AFTER_ATTEMPTS`, `RECONCILE_AFTER_SECONDS` (at least 3 provider timeouts).
 
 `apps/payments-sandbox`: `SANDBOX_PORT` (4002), `SANDBOX_BIND_HOST`, `SANDBOX_API_KEY` (same value as `PAYMENT_PROVIDER_API_KEY`), `SANDBOX_LATENCY_MS` (800), `SANDBOX_SLOW_LATENCY_MS` (10000).
 

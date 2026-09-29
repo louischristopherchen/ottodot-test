@@ -1,109 +1,104 @@
 # AI usage
 
+The work happened in two phases on the same day: the scoped take-home slice (tag
+`take-home-slice`), then a rebuild of the same design to production level on `main`.
+
 ## Tools
 
-- **Claude Code** (Anthropic's command-line coding agent) running Claude Opus
-  5.5, in a single session. It could run shell commands, edit files, and drive
-  a real Chrome window through the Claude in Chrome extension.
-- **A second Claude Code agent** acting as a read-only code reviewer, started
-  with a fresh context (it had not seen the design discussion) and asked to
-  look for correctness holes in the invariants.
+- **Claude Code** (Anthropic's command-line coding agent) running Claude Opus 5.5, in one session.
+  It ran shell commands, edited files, and drove Chrome through the Claude in Chrome extension.
+- **Specialist sub-agents** from my own Claude Code agent team, each started with a written brief:
+  - a researcher that read my other projects and reported the modules, versions and conventions I
+    normally use, so the rebuild would match my house style;
+  - a frontend engineer that built `apps/web` and `packages/ui` against a written API contract and
+    design spec;
+  - a production engineer that wrote the PM2, nginx, VPS setup, CI and deploy files;
+  - code reviewers (one for the slice, one for the rebuild) and a security auditor, each with a fresh
+    context, read-only, asked to verify findings before reporting them.
 
 No other AI tools were used.
 
 ## What I used AI for
 
-- Turning the brief into a design: the booking statuses, where the one binding
-  seat check lives, authorize / capture / void around it, and what to leave out.
-- Writing the code, the tests, the seed data and the first drafts of the README
-  and this file.
-- Running everything: the type checker, the test suite, the race demo, and the
-  page itself in Chrome with two parents racing for the last seat.
-- An independent review of the finished code.
+- Turning the brief into a design and, later, into a production architecture: where the one binding
+  seat check lives, authorize / capture / void around it, the outbox, the auth model.
+- Writing the code, tests, seed data and the first drafts of the documents.
+- Running everything: type checks, three test layers, the page in a real browser.
+- Independent review: a correctness review and a security audit of the finished code.
 
 ## One place where AI made me faster
 
-The concurrency tests. The brief's scenario is an ordering problem ("B finishes
-paying while A is still paying"), and a test that relies on sleeps would be
-flaky. The agent wrote a test double for the payment provider that pauses one
-booking's authorization until the test releases it, which makes the scenario an
-exact sequence. It then wrote a worker that pays from a separate OS process, so
-10 processes with their own database connections can race for one seat. Both
-were written, run and passing within minutes.
-
-The same goes for proving the tests mean something. Breaking the seat check on
-purpose, running the race tests and reverting took one command each, and gave
-the numbers quoted in the README (without the check and the triggers: 5 of 4
-seats, then 12 and 10 children confirmed into a single seat).
+Contract-first parallel work. Before any feature code, the API contract (`doc/agent-workspace/Architecture.md`)
+and the UI spec (`Design.md`) were written down. The frontend and the deploy setup were then built
+by separate agents at the same time as the backend, against those documents, and fitted together
+with small adjustments (a staff display name, the radio buttons' stacking order and two dev-server settings). The research agent
+also mapped my conventions across six of my repositories in a few minutes, down to the exact
+versions, the `ApiError` shape and the lock idiom I use (`findByPk(id, { lock: transaction.LOCK.UPDATE })`),
+which the rebuild then used for the seat claim.
 
 ## Where AI output was corrected or rejected
 
-- **The race was not demoable in the browser as first built.** The slow test
-  card approved after 6 seconds. When the two-window race was actually run in
-  Chrome, the first parent's payment completed before the second window could
-  pay, so the page correctly showed the class as full but the scenario from the
-  brief could not be shown. The slow card now takes 10 seconds and the delay is
-  configurable.
-- **A UI bug no test caught.** After pressing Pay, the page jumped back to the
-  top: the page re-renders on every change, and a smooth scroll was running at
-  the same time as the 3-second refresh. Found by measuring the scroll position
-  in the browser, fixed by keeping the scroll position across re-renders and
-  dropping the smooth scrolling.
-- **The independent review found real gaps, and they were fixed.** The
-  reviewer agent found no way to break the invariants (it probed double
-  submits, a decline racing a success in both orders, the class starting
-  mid-payment, and capture failure), but it found two things that mattered.
-  First, a failed capture gave the seat back but left the hold on the parent's
-  card. Second, no test would notice if `withWriteLock` stopped rolling back,
-  which would leave the shared connection stuck in a transaction after the
-  first 404. It also showed that removing the lock entirely was only caught by
-  the multi-process test some of the time (5 of 6 runs). The fixes: void the
-  hold after a failed capture; make every test fail if it leaves a transaction
-  open; add a deterministic two-connection test for the lock; add tests for
-  the overlapping payments it listed. Each new test was then checked by
-  breaking the code it protects and watching it fail.
-- **One review suggestion was declined.** The reviewer proposed answering a
-  repeated payment for an already-confirmed booking with `200` instead of
-  `409`. It stays `409`: that request did not create a payment, "the booking
-  is already confirmed" is a conflict with the resource's state, and the body
-  still carries the confirmed booking, so a client can show the right screen
-  either way. The proper fix for safe client retries is an `Idempotency-Key`
-  header that replays the original `200`, which is listed under next steps in
-  the README.
+From the slice:
+
+- The slow test card first approved after 6 seconds; driving the two-window race in Chrome showed
+  that was too short to demonstrate, so it became 10 seconds and configurable.
+- A page that jumped back to the top after paying was found by measuring the scroll position in the
+  browser, not by any test.
+- The slice's reviewer found that a failed capture left the card hold in place, and that no test
+  would notice a missing `ROLLBACK`. Both were fixed, with tests.
+
+From the rebuild:
+
+- **My own house style was overridden in one place on purpose.** My usual projects keep tokens in
+  localStorage, and my own code comments there say that is not for internet-facing apps. Here the
+  refresh token is an httpOnly cookie and the access token lives only in memory.
+- **A router bug** (a parents-only check mounted without a path, which blocked staff routes) was
+  caught by the first integration test run and fixed by moving to one router per resource.
+- **A race in the payments sandbox** (an `await` between looking up and registering an idempotency
+  key) was spotted in reading the code before any test ran.
+- **The first e2e run failed six tests and took 5.7 minutes.** The cause was the dev server: content
+  hashed file names plus lazy compilation made a hot update ask for a CSS file that no longer existed,
+  so pages sat on "Loading". A label overlay also covered the radio buttons. Neither showed up in unit
+  or integration tests.
+- **A dependency fix that only looked fixed:** after the first `npm overrides` attempt `npm audit`
+  reported 0 vulnerabilities because the dev server had been silently removed. Checking `npm ls`
+  instead of trusting the summary caught it.
+- **The rebuild's reviews found real problems, all fixed with a test each:**
+  - the correctness review showed an outage during capture could give the seat away after retries,
+    even when the money had been taken (the response was lost), and that marking the job failed and
+    releasing the seat were not atomic; it also found that a refresh in one tab cut off the other
+    tabs, that the expiry job could race a payment, and three smaller issues;
+  - the security audit found that the login limiter did not stop password spraying, that the account
+    lockout let anyone lock a parent out and revealed which emails exist, that sessions could be
+    extended forever, that the VPS setup script could be abused through symlinks on a re-run, and six
+    smaller items. It found no SEV1 or SEV2 issue.
+  After the fixes, each bug was put back on purpose to confirm its new test fails.
+- **One review suggestion was declined** in the slice: answering a repeated payment for an already
+  confirmed booking with `200` instead of `409`. The rebuild settled it differently: every processed
+  payment now returns `200` with an `outcome`, and repeated requests are handled by `Idempotency-Key`.
 
 ## What I would change about the workflow next time
 
-- **Write the race tests before the booking service.** Here they came straight
-  after it. Starting from a failing race test would have made the mutation
-  check the first step rather than a later one.
-- **Drive the real page earlier.** Both UI problems above were invisible to a
-  fully passing test suite and only showed up in the browser.
-- **Run the independent review right after the backend commit**, while changes
-  were cheap, instead of after the UI was built.
-- **Write the design section before the code.** The README's race section was
-  written after the implementation. Drafting it first is the cheaper place to
-  argue about seat holds versus a confirm-time check.
+- **Run the e2e suite and the reviews earlier.** The dev-server bug, the overlay and every review
+  finding appeared after the code looked finished; each was cheap to fix, but earlier is cheaper.
+- **Write the failure-mode tests first for anything that touches money.** The outage and
+  lost-response cases were found by review, not by the first test plan.
+- **Keep the contract-first split.** It is what made parallel agents work without collisions; the
+  rule that only one agent installs dependencies avoided lockfile fights.
+- **Verify tool output, not summaries:** `npm ls` over the audit count, the page snapshot over the
+  test name.
 
 ## How the final implementation was verified
 
-- `npm run check`: TypeScript type check plus 47 tests, all passing. The tests
-  cover every case in the brief, including the exact last-seat sequence, a
-  crowd of 12 parents in one process, 10 separate OS processes, a
-  double-submitted payment, overlapping payments on one booking, the write
-  lock across two connections, and raw SQL that bypasses the application.
-- Mutation checks: with the seat re-check removed, the database triggers still
-  refused every extra seat; with the triggers removed as well, the race tests
-  failed with 5 of 4, 12 and 10 confirmed. After the review, four more breaks
-  (no `ROLLBACK`, a deferred `BEGIN`, no void after a failed capture, a late
-  decline ignoring a cancellation) were each caught. All were reverted.
-- `npm run demo:race`: the scenario from the brief with timings, the
-  10-process race (1 confirmed, 9 refused and voided) and the rejected raw SQL.
-- In Chrome: book, decline, retry; the duplicate booking message; the
-  two-window race with the slow card (A cancelled as class full, not charged;
-  B confirmed); the staff roster showing 4 of 4 with A under "Not on the
-  roster". No console errors.
-- An independent review by a second agent with a fresh context, which ran its
-  own probes and deliberately broken copies of the code in a scratch folder.
-  Its findings and what happened to them are listed above.
-- A fresh clone of the repository installs with `npm ci`, passes the tests,
-  and starts the server with seeded data on the first run.
+- **Automated:** 107 unit tests (shared, API, sandbox, web), 75 integration tests against a real
+  Postgres, 11 Playwright end-to-end tests against the real stack; ESLint, a prose check (no em dashes,
+  no filler words), TypeScript in every workspace, and a production build.
+- **Mutation checks:** in the slice, removing the seat re-check and the database backstop made the
+  race tests confirm 5 of 4, 12 of 1 and 10 of 1 seats. In the rebuild, reintroducing each reviewed
+  bug made its test fail.
+- **Live runs:** the full flow over HTTP against the real sandbox (booking, decline, idempotent
+  replay, the last-seat race, a refused capture); the compiled API, worker and sandbox started as PM2
+  would start them, reported ready, and shut down cleanly on SIGTERM.
+- **Reviews:** two correctness reviews and one security audit by agents with fresh contexts, which
+  ran their own probes; every finding was checked against the code before it was fixed or declined.
+- **Clean install:** the slice was checked from a fresh clone; `npm audit` reports no vulnerabilities.

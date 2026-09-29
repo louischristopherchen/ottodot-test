@@ -25,8 +25,8 @@ password `trial-demo-2026`.
 
 | Command | What it does |
 | --- | --- |
-| `npm run test:unit` | 101 unit tests, no database (shared, API, sandbox, web) |
-| `npm run test:integration` | 62 API tests against a real Postgres (`npm run db:start` first) |
+| `npm run test:unit` | 107 unit tests, no database (shared, API, sandbox, web) |
+| `npm run test:integration` | 75 API tests against a real Postgres (`npm run db:start` first) |
 | `npx playwright install chromium` then `npm run test:e2e` | 11 browser tests; starts its own stack on ports 4100 to 4102 |
 | `npm run lint`, `npm run lint:prose`, `npm run typecheck` | ESLint, a check for em dashes and filler words, TypeScript |
 | `npm run db:reset` | Wipe and reseed the demo data (class times are relative to now) |
@@ -123,8 +123,10 @@ cannot overbook.
 - A parent can reach the payment step and still lose the seat, when two parents pay for the same last
   seat within seconds. The loser gets a clear message and is not charged.
 - Between the claim and the capture, a booking is `confirmed` with the money only authorized. A
-  temporary capture failure is retried with backoff; if the capture is refused for good, the seat is
-  released, the booking goes back to `payment_failed` and the hold is voided.
+  capture that times out or hits a provider error is retried until it succeeds (a lost response may
+  hide a success, so an outage never gives the seat away). Only a definite refusal, checked against
+  the provider's own record, releases the seat, sends the booking back to `payment_failed` and voids
+  the hold.
 - Seats are never granted in the background. If an authorization is found after its request died,
   reconciliation voids it and the parent pays again.
 
@@ -201,9 +203,10 @@ The full contract is in `doc/agent-workspace/Architecture.md`.
 | --- | --- |
 | Card declined | Attempt `declined`, booking `payment_failed`, seat untouched (it was never held); the parent can retry |
 | Provider timeout or 5xx while authorizing | Booking `payment_failed` so the parent can retry at once; the attempt stays `processing` and the worker's reconciliation asks the provider later and voids any authorization it finds |
-| Capture fails briefly | Seat kept; the capture job retries with backoff (10 s, 20 s, 40 s and so on) |
-| Capture refused for good, or retries exhausted | Seat released (booking `payment_failed`), attempt `capture_failed`, then the hold is voided |
-| Void fails | Logged at error level for an alert; the hold lapses at the issuer |
+| Capture or void times out, or the provider answers 5xx | Seat kept; the job retries with capped backoff (10 s, 20 s, 40 s, up to 10 minutes) for as long as it takes, and logs at error level after `PAYMENT_JOB_ALERT_AFTER_ATTEMPTS` tries |
+| Capture refused | The provider is asked for the authorization's state first: if the money was in fact captured (the answer was lost), the seat stays. Otherwise, in one transaction, the seat is released (booking `payment_failed`), the attempt marked `capture_failed` and a void queued |
+| Void refused | Logged at error level; if the provider says the payment was captured, the log asks for a manual refund |
+| Request stalls past the reconcile window | Reconciliation settles the attempt; when the request finally resumes it takes no seat and releases its own hold |
 
 ### Where each check lives
 
@@ -216,15 +219,19 @@ The full contract is in `doc/agent-workspace/Architecture.md`.
 
 ## Production concerns
 
-- **Authentication:** JWT access token (30 minutes, `iss`, `aud` and `type` verified, session checked
-  on every request so logout takes effect at once) kept in memory by the SPA, never in web storage.
+- **Authentication:** JWT access token (30 minutes, `iss`, `aud` and `type` verified) kept in memory by
+  the SPA, never in web storage. It is valid while its sign-in (session family) is alive, checked on
+  every request, so logout takes effect at once but a refresh in one tab does not end the others.
   Refresh token in an httpOnly, `SameSite=Strict`, `Path=/api/auth` cookie, rotated on every use;
-  reusing an old token revokes the whole session family, with a 10 second grace window for two tabs
-  refreshing together. Origin allow-list on the cookie routes. bcryptjs with a dummy hash for unknown
-  emails and a lockout ladder after five failures.
+  reusing an old token revokes the whole sign-in (10 second grace window for two tabs refreshing
+  together). A sign-in lasts at most 30 days, and `POST /api/auth/logout-all` ends every sign-in.
+  Origin allow-list on the cookie routes. bcryptjs with a dummy hash for unknown emails.
+- **Login throttling:** three rate limits (per IP, per IP and email, per email across IPs) instead of
+  an account lockout, so a stranger cannot lock a parent out and no response reveals which emails
+  have accounts.
 - **Hardening:** validated environment (the process refuses to start with a missing secret), helmet
-  with a JSON-only CSP, CORS allow-list, rate limits (global, per IP and email for login, per user for
-  payments), 16 KB body limit, `trust proxy` for nginx, 5xx messages masked.
+  with a JSON-only CSP, CORS allow-list, rate limits (IPv6 grouped by /64), 16 KB body limit,
+  `Cache-Control: no-store` on API responses, `trust proxy` for nginx, 5xx messages masked.
 - **Observability:** one JSON log line per request with a request id (also returned as `X-Request-Id`),
   credential-looking keys redacted; worker steps log counts; `/health` and `/health/ready`.
 - **Operations:** graceful shutdown on SIGTERM and SIGINT for the API and the worker; the worker is
@@ -238,12 +245,16 @@ The full contract is in `doc/agent-workspace/Architecture.md`.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |
-| Unit (101) | `*/src/__tests__/` | Seat decisions, outcome messages, backoff, token claims, password lockout, provider error classification, error mapping, redaction, the web API client (refresh once, retry with the same Idempotency-Key), formatters |
-| Integration (62) | `apps/api/src/__tests__/integration/` | Against Postgres: the brief's race in exact order (a fake provider pauses A until B finishes), 12 parents paying at once (1 confirmed), a double submit charged once, a proof that the claim waits on the class row lock, raw SQL that tries to overbook, auth rotation and reuse detection, idempotency, the worker's retries, reconciliation and expiry, and the sandbox client against the real sandbox process |
+| Unit (107) | `*/src/__tests__/` | Seat decisions, outcome messages, backoff, token claims, password lockout, provider error classification, error mapping, redaction, the web API client (refresh once, retry with the same Idempotency-Key), formatters |
+| Integration (75) | `apps/api/src/__tests__/integration/` | Against Postgres: the brief's race in exact order (a fake provider pauses A until B finishes), 12 parents paying at once (1 confirmed), a double submit charged once, a proof that the claim waits on the class row lock, raw SQL that tries to overbook, auth rotation, reuse detection and tabs, idempotency, the worker's retries (including an outage and a lost capture response), atomic seat release, reconciliation racing a stalled request, expiry racing a payment, the seed guard, and the sandbox client against the real sandbox process |
 | End to end (11) | `e2e/` | Playwright against the real stack: sign-in and the httpOnly session, book and pay, decline then retry, duplicate refused, the race in two browsers, staff roster, role redirects |
 
-The slice (tag `take-home-slice`) also recorded mutation checks: with the seat re-check and the
-database backstop removed, the race tests confirmed 5 of 4, 12 of 1 and 10 of 1 seats and failed.
+Mutation checks: in the slice (tag `take-home-slice`), removing the seat re-check and the database
+backstop made the race tests confirm 5 of 4, 12 of 1 and 10 of 1 seats. On `main`, putting back each
+bug found in review (giving up on transient capture failures, skipping the provider check before
+releasing a seat, claiming a seat on a reconciled attempt, validating tokens per session instead of
+per sign-in, refreshing twice in the SPA) made its test fail. Both reviews are summarised in
+[AI_USAGE.md](AI_USAGE.md).
 
 ## Assumptions
 
@@ -267,11 +278,11 @@ database backstop removed, the race tests confirmed 5 of 4, 12 of 1 and 10 of 1 
 
 - **Invariants that should read zero:** classes with `confirmed_count` different from their confirmed
   bookings; confirmed bookings whose attempt is not `captured` after a few minutes; `payment_jobs` in
-  `failed`; attempts stuck in `processing` past the reconcile window.
+  `failed`, or pending past the alert threshold; attempts stuck in `processing` past the reconcile window.
 - **Race losses:** payments authorized and then refused with `class_full`, per class. This decides
   whether seat holds are worth building.
 - **Payments:** decline rate, provider latency and errors, capture retries, void failures.
-- **Security:** failed logins and lockouts, refresh-token reuse detections, 429s.
+- **Security:** failed logins, login 429s by limiter, refresh-token reuse detections.
 - **Funnel:** bookings created versus paid; bookings expired unpaid.
 - **Database:** lock wait time on `trial_classes`, pool saturation, p95 of the claim transaction.
 
@@ -285,7 +296,14 @@ database backstop removed, the race tests confirmed 5 of 4, 12 of 1 and 10 of 1 
 
 ## Time spent
 
-TIME_SPENT_PLACEHOLDER
+On 29 September 2026, in one Claude Code session (see [AI_USAGE.md](AI_USAGE.md)):
+
+- **Take-home slice** (tag `take-home-slice`): about 45 minutes, inside the brief's 4-hour cap.
+- **Production rebuild** (`main`): about 5 hours, with specialist agents working in parallel for
+  parts of it: conventions research, backend, frontend and deploy, three test layers, a correctness
+  review and a security audit, and the fixes they led to.
+
+Reading through the code myself and recording the walkthrough are not included.
 
 ## AI usage
 
