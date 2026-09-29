@@ -101,4 +101,5 @@ From the rebuild:
   would start them, reported ready, and shut down cleanly on SIGTERM.
 - **Reviews:** two correctness reviews and one security audit by agents with fresh contexts, which
   ran their own probes; every finding was checked against the code before it was fixed or declined.
-- **Clean install:** the slice was checked from a fresh clone; `npm audit` reports no vulnerabilities.
+- **Clean install:** a fresh clone of `main`, with no `.env` and no `node_modules`, installs with `npm ci`,
+  builds, and passes lint, typecheck and all three test layers; `npm audit` reports no vulnerabilities.
