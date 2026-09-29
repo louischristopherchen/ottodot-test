@@ -1,0 +1,29 @@
+{
+  "name": "ottodot-trial-booking",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Trial class booking slice: book, pay (mock), confirm, roster. Handles duplicates, overbooking, payment failure and the last-seat race.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "dev": "node --watch src/server.ts",
+    "db:reset": "node src/cli/reset-db.ts",
+    "roster": "node src/cli/roster.ts",
+    "demo:race": "node src/cli/race-demo.ts",
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.19.0",
+    "typescript": "^7.0.2"
+  }
+}
