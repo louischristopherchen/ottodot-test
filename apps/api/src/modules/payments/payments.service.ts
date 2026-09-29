@@ -68,6 +68,10 @@ class PaymentsService {
 				await booking.update({ status: 'cancelled', cancelReason: refusal }, { transaction });
 				return { kind: 'done', outcome: outcomeForRefusal(refusal) };
 			}
+			// Touch the booking in this transaction: the expiry job, if it is waiting on the row
+			// lock, then re-checks its cutoff against the new timestamp and leaves the booking alone.
+			booking.changed('updatedAt', true);
+			await booking.save({ transaction });
 			const attempt = await PaymentAttempt.create(
 				{
 					bookingId,
@@ -128,10 +132,21 @@ class PaymentsService {
 		const claim = await sequelize.transaction(async (transaction) => {
 			const trialClass = (await TrialClass.findByPk(start.trialClassId, { lock: transaction.LOCK.UPDATE, transaction }))!;
 			const booking = (await Booking.findByPk(bookingId, { lock: transaction.LOCK.UPDATE, transaction }))!;
-			await PaymentAttempt.update(
+			const [stillProcessing] = await PaymentAttempt.update(
 				{ status: 'authorized', providerRef: authorization.providerRef },
-				{ where: { id: attemptId }, transaction },
+				{ where: { id: attemptId, status: 'processing' }, transaction },
 			);
+			if (stillProcessing === 0) {
+				// Reconciliation already settled this attempt while the request was stalled.
+				// Never take a seat on it; record the authorization so the void can release it.
+				await PaymentAttempt.update({ providerRef: authorization.providerRef }, { where: { id: attemptId }, transaction });
+				await Booking.update(
+					{ status: 'payment_failed' },
+					{ where: { id: bookingId, status: [...PAYABLE_BOOKING_STATUSES] }, transaction },
+				);
+				const job = await paymentJobsService.enqueue(attemptId, 'void', transaction);
+				return { outcome: 'payment_declined' as PaymentOutcome, jobId: job.id };
+			}
 
 			const decision = decideSeatClaim(booking, trialClass, new Date());
 			if (decision.action === 'confirm') {
@@ -149,8 +164,16 @@ class PaymentsService {
 			return { outcome, jobId: job.id };
 		});
 
-		// Step 4: move the money now. If this does not finish, the worker retries the job.
-		const jobResult = await paymentJobsService.runJob(claim.jobId);
+		// Step 4: move the money now. The seat decision is already committed with its job, so
+		// if this fails the worker runs the job once its lease expires; the parent's answer stands.
+		const jobResult = await paymentJobsService.runJob(claim.jobId).catch((error: unknown) => {
+			logger.error('Running the payment job inline failed; the worker will retry it', {
+				paymentAttemptId: attemptId,
+				jobId: claim.jobId,
+				error,
+			});
+			return 'retry_scheduled' as const;
+		});
 		const outcome = claim.outcome === 'confirmed' && jobResult === 'compensated' ? 'payment_declined' : claim.outcome;
 		return this.result(bookingId, outcome, attemptId);
 	}

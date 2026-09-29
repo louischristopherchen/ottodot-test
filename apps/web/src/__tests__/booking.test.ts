@@ -9,6 +9,7 @@ import {
 	isPayable,
 	lastPaymentAttempt,
 	newerBooking,
+	paymentOfRecord,
 	upsertBooking,
 } from '../lib/booking';
 
@@ -130,5 +131,22 @@ describe('upsertBooking', () => {
 
 	test('should start a list when the cache is empty', () => {
 		assert.equal(upsertBooking(undefined, booking()).length, 1);
+	});
+});
+
+describe('payment of record', () => {
+	test('should show the captured attempt when a later duplicate attempt was voided', () => {
+		const doubleClicked = booking({
+			status: 'confirmed',
+			confirmedAt: '2026-09-29T01:00:00.000Z',
+			paymentAttempts: [attempt('captured'), attempt('voided')],
+		});
+		assert.equal(paymentOfRecord(doubleClicked)?.status, 'captured');
+		assert.equal(bookingPaymentText(doubleClicked), 'Paid');
+	});
+
+	test('should show the latest attempt when the booking is not confirmed', () => {
+		const retried = booking({ status: 'payment_failed', paymentAttempts: [attempt('voided'), attempt('declined', 'insufficient_funds')] });
+		assert.equal(paymentOfRecord(retried)?.status, 'declined');
 	});
 });

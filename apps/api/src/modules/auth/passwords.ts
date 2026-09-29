@@ -20,14 +20,3 @@ export async function verifyPassword(password: string, hash: string | null): Pro
 	const matches = await bcrypt.compare(password, hash ?? (await dummyHash));
 	return hash !== null && matches;
 }
-
-export const LOCKOUT_THRESHOLD = 5;
-
-/** Lockout ladder: 1 minute after the 5th failure in a row, 5 after the 6th, 15 after that. */
-export function lockedUntilAfter(failedCount: number, now: Date): Date | null {
-	if (failedCount < LOCKOUT_THRESHOLD) {
-		return null;
-	}
-	const minutes = failedCount === LOCKOUT_THRESHOLD ? 1 : failedCount === LOCKOUT_THRESHOLD + 1 ? 5 : 15;
-	return new Date(now.getTime() + minutes * 60_000);
-}

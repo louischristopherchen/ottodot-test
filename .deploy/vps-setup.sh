@@ -95,6 +95,23 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '    WARNING: %s\n' "$*" >&2; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
+# -----------------------------------------------------------------------------
+# Privilege boundary. This script runs as root; APP_USER does not. Anything the
+# deploy user owns (its home, the deploy root, the env files) can be swapped for
+# a symlink between runs, e.g. `ln -s /etc ~/trial-booking`, and a root chown or
+# write through it would hand that target to the deploy user. So:
+#   - files and directories the deploy user owns are created and edited AS that
+#     user (as_app), never by root;
+#   - root checks those paths for planted symlinks first and refuses to go on;
+#   - root never executes a binary from the deploy user's home (the PM2 boot
+#     unit is written as a static file instead of running `pm2 startup`).
+# -----------------------------------------------------------------------------
+
+# Run a command as APP_USER.
+as_app() {
+	sudo -u "${APP_USER}" -H "$@"
+}
+
 # Run a bash snippet as APP_USER with nvm loaded. Snippets passed here never
 # contain secrets (arguments are visible in the process list).
 app_sh() {
@@ -102,9 +119,27 @@ app_sh() {
 		'set -eo pipefail; export NVM_DIR="$HOME/.nvm"; if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh"; fi; '"$1"
 }
 
-# Read KEY=value from an env file (last occurrence wins, like dotenv).
+# Die if any component of $1 is a symlink the deploy user could have planted:
+# one inside its home, one it owns, or one in a directory it owns.
+assert_no_user_symlink() {
+	local p="$1"
+	while [ -n "${p}" ] && [ "${p}" != "/" ]; do
+		if [ -L "${p}" ]; then
+			case "${p}/" in
+				"${APP_HOME}"/*) die "${p} is a symlink inside ${APP_HOME}. Refusing to follow it as root." ;;
+			esac
+			if [ "$(stat -c %U "${p}")" = "${APP_USER}" ] || [ "$(stat -c %U "$(dirname "${p}")")" = "${APP_USER}" ]; then
+				die "${p} is a symlink controlled by ${APP_USER}. Refusing to follow it as root."
+			fi
+		fi
+		p="$(dirname "${p}")"
+	done
+}
+
+# Read KEY=value from an env file (last occurrence wins, like dotenv). Read as
+# APP_USER so a planted symlink cannot make root copy another file's secrets.
 env_value() {
-	sed -n "s/^$2=//p" "$1" | tail -n 1
+	as_app sed -n "s/^$2=//p" "$1" | tail -n 1
 }
 
 # =============================================================================
@@ -121,6 +156,23 @@ log "[0/9] Preflight"
 for f in nginx.conf nginx-tls.conf "${SNIPPETS[@]/#/snippets/}"; do
 	[ -f "${SCRIPT_DIR}/${f}" ] || die "missing ${SCRIPT_DIR}/${f}. Copy the whole .deploy/ folder, not just this script."
 done
+
+# Root runs this script and installs its nginx templates, so the deploy user
+# must not be able to edit them. The copy that CI rsyncs into the deploy root
+# is deploy-owned: never run that one.
+if id -u "${APP_USER}" >/dev/null 2>&1; then
+	APP_HOME_PRE="$(getent passwd "${APP_USER}" | cut -d: -f6)"
+	case "${SCRIPT_DIR}/" in
+		"${APP_DIR}"/* | "${APP_HOME_PRE}"/*)
+			die "run the copy of .deploy/ in a root-owned place (e.g. /root/trial-booking-deploy), not ${SCRIPT_DIR}." ;;
+	esac
+	for f in "${SCRIPT_DIR}" "${SCRIPT_DIR}/snippets" "${SCRIPT_DIR}/vps-setup.sh" \
+		"${SCRIPT_DIR}/nginx.conf" "${SCRIPT_DIR}/nginx-tls.conf" "${SNIPPETS[@]/#/${SCRIPT_DIR}/snippets/}"; do
+		if sudo -u "${APP_USER}" test -w "${f}"; then
+			die "${f} is writable by ${APP_USER}; root will not run or install it."
+		fi
+	done
+fi
 
 [[ "${DOMAIN}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] \
 	|| die "DOMAIN '${DOMAIN}' is not a valid hostname."
@@ -193,17 +245,20 @@ else
 	info "created"
 fi
 APP_HOME="$(getent passwd "${APP_USER}" | cut -d: -f6)"
+[[ "${APP_HOME}" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "unexpected home directory '${APP_HOME}' for ${APP_USER}."
+assert_no_user_symlink "${APP_HOME}"
+[ -d "${APP_HOME}" ] || die "${APP_HOME} is not a directory."
 
-install -d -m 700 -o "${APP_USER}" -g "${APP_USER}" "${APP_HOME}/.ssh"
 AUTH_KEYS="${APP_HOME}/.ssh/authorized_keys"
-touch "${AUTH_KEYS}"
-chmod 600 "${AUTH_KEYS}"
-chown "${APP_USER}:${APP_USER}" "${AUTH_KEYS}"
+assert_no_user_symlink "${AUTH_KEYS}"
+# Created and edited by the user itself, so nothing here runs as root.
+as_app install -d -m 700 "${APP_HOME}/.ssh"
+as_app sh -c 'umask 077 && touch "$1" && chmod 600 "$1"' sh "${AUTH_KEYS}"
 if [ -n "${DEPLOY_SSH_PUBKEY}" ]; then
-	if grep -qxF "${DEPLOY_SSH_PUBKEY}" "${AUTH_KEYS}"; then
+	if as_app grep -qxF -- "${DEPLOY_SSH_PUBKEY}" "${AUTH_KEYS}"; then
 		info "deploy key already authorized"
 	else
-		printf '%s\n' "${DEPLOY_SSH_PUBKEY}" >> "${AUTH_KEYS}"
+		printf '%s\n' "${DEPLOY_SSH_PUBKEY}" | as_app tee -a "${AUTH_KEYS}" >/dev/null
 		info "deploy key added to ${AUTH_KEYS}"
 	fi
 fi
@@ -233,9 +288,13 @@ EOF
 
 # Ubuntu's ~/.bashrc returns early in non-interactive shells, so
 # `sudo -iu deploy pm2 status` would not find pm2. Load nvm from ~/.profile too.
+# Edited as the user, like everything else in its home.
 NVM_MARKER="# trial-booking: load nvm for login shells"
-if ! grep -qF "${NVM_MARKER}" "${APP_HOME}/.profile" 2>/dev/null; then
-	cat >> "${APP_HOME}/.profile" <<'PROFILE'
+PROFILE_FILE="${APP_HOME}/.profile"
+assert_no_user_symlink "${PROFILE_FILE}"
+as_app touch "${PROFILE_FILE}"
+if ! as_app grep -qF -- "${NVM_MARKER}" "${PROFILE_FILE}"; then
+	as_app tee -a "${PROFILE_FILE}" >/dev/null <<'PROFILE'
 
 # trial-booking: load nvm for login shells
 export NVM_DIR="$HOME/.nvm"
@@ -243,9 +302,8 @@ export NVM_DIR="$HOME/.nvm"
 PROFILE
 fi
 # The runbook's commands use $DEPLOY_PATH; keep it in step with APP_DIR.
-sed -i '/^export DEPLOY_PATH=/d' "${APP_HOME}/.profile"
-printf 'export DEPLOY_PATH=%s\n' "${APP_DIR}" >> "${APP_HOME}/.profile"
-chown "${APP_USER}:${APP_USER}" "${APP_HOME}/.profile"
+as_app sed -i '/^export DEPLOY_PATH=/d' "${PROFILE_FILE}"
+printf 'export DEPLOY_PATH=%s\n' "${APP_DIR}" | as_app tee -a "${PROFILE_FILE}" >/dev/null
 
 app_sh "
 	nvm install ${NODE_MAJOR}
@@ -314,11 +372,16 @@ else
 	sudo -u postgres createdb -p "${PG_PORT}" -O "${DB_USER}" "${DB_NAME}"
 	info "database ${DB_NAME}: created, owner ${DB_USER}"
 fi
-# Only the app role (and superusers) may connect.
+# Only the app role (and superusers) may connect. The comment marks the
+# database as production: the API's seed and reset scripts read it and refuse
+# to load demo accounts (published password) unless ALLOW_DEMO_SEED=true.
+# Applied on every run, so an existing or restored database gets it too.
 pg <<SQL
 REVOKE ALL ON DATABASE "${DB_NAME}" FROM PUBLIC;
 GRANT CONNECT, TEMPORARY ON DATABASE "${DB_NAME}" TO "${DB_USER}";
+COMMENT ON DATABASE "${DB_NAME}" IS 'environment=production';
 SQL
+info "database ${DB_NAME}: marked environment=production (seed guard)"
 
 # Fail now, before nginx and TLS, if the API env file cannot be written.
 if [ ! -f "${API_ENV}" ] && [ "${DB_PASSWORD_STATE}" = "unchanged" ]; then
@@ -330,16 +393,44 @@ fi
 # [5] Deploy root
 # =============================================================================
 log "[5/9] Deploy root ${APP_DIR}"
-install -d -m 755 "${APP_DIR}"
-chown "${APP_USER}:${APP_USER}" "${APP_DIR}"
-sudo -u "${APP_USER}" mkdir -p "${APP_DIR}/logs" "${APP_DIR}/apps/api" "${APP_DIR}/apps/payments-sandbox"
+assert_no_user_symlink "${APP_DIR}"
+if [ ! -d "${APP_DIR}" ]; then
+	case "${APP_DIR}/" in
+		# Inside the home: the user creates it, root never touches it.
+		"${APP_HOME}"/*) as_app mkdir -p -m 755 "${APP_DIR}" ;;
+		# Elsewhere (e.g. /srv/trial-booking). If the user can write the parent it
+		# creates the directory itself. Otherwise root creates only the last
+		# component (mkdir never follows a symlink there) and hands it over with
+		# chown -h, which does not follow one either.
+		*)
+			APP_PARENT="$(dirname "${APP_DIR}")"
+			[ -d "${APP_PARENT}" ] || die "${APP_PARENT} does not exist. Create it (root-owned) or use a path under ${APP_HOME}."
+			if as_app test -w "${APP_PARENT}"; then
+				as_app mkdir -m 755 "${APP_DIR}"
+			else
+				mkdir -m 755 "${APP_DIR}"
+				chown -h "${APP_USER}:${APP_USER}" "${APP_DIR}"
+			fi
+			;;
+	esac
+fi
+[ -d "${APP_DIR}" ] && [ ! -L "${APP_DIR}" ] || die "${APP_DIR} is not a plain directory."
+[ "$(stat -c %U "${APP_DIR}")" = "${APP_USER}" ] || chown -h "${APP_USER}:${APP_USER}" "${APP_DIR}"
+as_app mkdir -p "${APP_DIR}/logs" "${APP_DIR}/apps/api" "${APP_DIR}/apps/payments-sandbox"
 
 # nginx runs as www-data and must reach apps/web/dist. Ubuntu creates home
-# directories as 0750, so grant traverse (o+x) on each parent: no listing, and
-# the mode-600 env files stay unreadable.
+# directories as 0750, so grant traverse (o+x) on each parent that lacks it: no
+# listing, and the mode-600 env files stay unreadable. Directories the deploy
+# user owns are changed by that user; root only changes its own.
 d="${APP_DIR}"
 while [ "${d}" != "/" ]; do
-	chmod o+x "${d}"
+	if [ ! -L "${d}" ] && [ $(( 8#$(stat -c %a "${d}") & 1 )) -eq 0 ]; then
+		if [ "$(stat -c %U "${d}")" = "${APP_USER}" ]; then
+			as_app chmod o+x "${d}"
+		else
+			chmod o+x "${d}"
+		fi
+	fi
 	d="$(dirname "${d}")"
 done
 
@@ -355,6 +446,8 @@ if [ -f "${CERT_DIR}/fullchain.pem" ] || [ "${WANT_TLS}" = "true" ]; then SCHEME
 
 # The API and the sandbox share one API key. Reuse it from whichever file
 # already has it, so writing only the missing file keeps them in step.
+assert_no_user_symlink "${API_ENV}"
+assert_no_user_symlink "${SANDBOX_ENV}"
 PROVIDER_KEY=""
 if [ -f "${API_ENV}" ]; then PROVIDER_KEY="$(env_value "${API_ENV}" PAYMENT_PROVIDER_API_KEY)"; fi
 if [ -z "${PROVIDER_KEY}" ] && [ -f "${SANDBOX_ENV}" ]; then PROVIDER_KEY="$(env_value "${SANDBOX_ENV}" SANDBOX_API_KEY)"; fi
@@ -362,17 +455,19 @@ PROVIDER_KEY="${PROVIDER_KEY:-$(openssl rand -hex 24)}"
 
 if [ "${SCHEME}" = "https" ]; then COOKIE_SECURE="true"; else COOKIE_SECURE="false"; fi
 
-# Create with umask 077 so the file is never readable by others, even briefly.
+# Written by the deploy user (never root) with umask 077, so the file is mode
+# 600 from the start. noclobber makes the shell refuse to write through
+# anything, symlinks included, that appeared after the existence check.
+# Secrets travel on stdin, not in arguments.
 write_env() {
 	local file="$1"
+	assert_no_user_symlink "${file}"
 	if [ -e "${file}" ]; then
 		cat > /dev/null
 		info "${file} exists, left unchanged"
 		return 0
 	fi
-	(umask 077 && cat > "${file}")
-	chown "${APP_USER}:${APP_USER}" "${file}"
-	chmod 600 "${file}"
+	as_app bash -c 'set -o noclobber; umask 077; cat > "$1"' bash "${file}"
 	info "${file} written (mode 600)"
 }
 
@@ -505,13 +600,47 @@ fi
 # PM2 systemd unit
 # =============================================================================
 log "PM2 startup"
-# `pm2 startup` only prints the root command it needs; run that command
-# directly instead of evaluating captured output. It bakes the current Node
-# path into the unit, so re-run this script after changing NODE_MAJOR.
+# `pm2 startup` would have to run the deploy user's own pm2 binary as root, and
+# that user can replace the binary. Write the same unit PM2 would generate as a
+# static, root-owned file instead. systemd starts it as APP_USER (User=), so the
+# binaries in the user's home only ever run with that user's rights. The unit
+# holds the current Node path: re-run this script after changing NODE_MAJOR.
 NODE_BIN_DIR="$(app_sh 'dirname "$(command -v node)"')"
-env PATH="${NODE_BIN_DIR}:${PATH}" "${NODE_BIN_DIR}/pm2" startup systemd -u "${APP_USER}" --hp "${APP_HOME}" >/dev/null
-systemctl enable "pm2-${APP_USER}" >/dev/null 2>&1 || true
-info "pm2-${APP_USER}.service enabled; it restores the list saved by 'pm2 save'"
+# The value goes into a root-owned unit file: accept only the nvm layout.
+[[ "${NODE_BIN_DIR}" =~ ^"${APP_HOME}"/\.nvm/versions/node/v[0-9]+\.[0-9]+\.[0-9]+/bin$ ]] \
+	|| die "unexpected Node location '${NODE_BIN_DIR}'."
+PM2_UNIT="/etc/systemd/system/pm2-${APP_USER}.service"
+cat > "${PM2_UNIT}" <<EOF
+# Written by trial-booking .deploy/vps-setup.sh. Same shape as the unit
+# \`pm2 startup systemd\` generates, without running pm2 as root.
+[Unit]
+Description=PM2 process manager for ${APP_USER}
+Documentation=https://pm2.keymetrics.io/
+After=network.target postgresql.service
+
+[Service]
+Type=forking
+User=${APP_USER}
+Group=${APP_USER}
+NoNewPrivileges=true
+LimitNOFILE=infinity
+Environment=PATH=${NODE_BIN_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PM2_HOME=${APP_HOME}/.pm2
+PIDFile=${APP_HOME}/.pm2/pm2.pid
+Restart=on-failure
+ExecStart=${NODE_BIN_DIR}/pm2 resurrect
+ExecReload=${NODE_BIN_DIR}/pm2 reload all
+ExecStop=${NODE_BIN_DIR}/pm2 kill
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 644 "${PM2_UNIT}"
+systemctl daemon-reload
+systemctl enable "pm2-${APP_USER}.service" >/dev/null
+# Not started here: the PM2 daemon already running for the deploy user (from
+# the pm2-logrotate setup) serves this boot; the unit takes over from the next.
+info "pm2-${APP_USER}.service enabled; at boot it restores the list saved by 'pm2 save'"
 
 # =============================================================================
 # Consistency checks between the env files and what was provisioned
@@ -557,14 +686,15 @@ cat <<EOF
                 Review both against the .env.example files after the first deploy.
  Database     : ${DB_NAME} on 127.0.0.1:${PG_PORT}, role ${DB_USER}
 
- GitHub repository secrets:
+ GitHub: Settings > Environments > production (restrict it to the main
+ branch and add a required reviewer; see .deploy/README.md). Secrets:
    VPS_HOST      this server's public address or DNS name
    VPS_USER      ${APP_USER}
    VPS_PORT      ${FIRST_SSH_PORT}
    VPS_SSH_KEY   private half of the deploy key (public half in ${AUTH_KEYS})
    VPS_HOST_KEY  this line, with <VPS_HOST> replaced by the exact VPS_HOST value:
                  ${KNOWN_HOST} ${HOST_KEY:-<no ed25519 host key found>}
- GitHub repository variables:
+ Variables (same environment):
    DEPLOY_PATH         ${APP_DIR}
    SHOW_DEMO_ACCOUNTS  optional, "true" shows the seeded demo logins
 

@@ -4,6 +4,21 @@ import { ApiError } from '../../middleware/error-handler.js';
 import { Booking, PaymentAttempt, Student, TrialClass, User } from '../../models/index.js';
 import { toTrialClassDto } from '../bookings/booking.mapper.js';
 
+/**
+ * The attempt that paid for a confirmed booking, or else the latest one. A double click
+ * can leave a later, voided attempt next to the one that was captured.
+ */
+function paymentOfRecord(booking: Booking): PaymentAttempt | undefined {
+	const attempts = booking.paymentAttempts ?? [];
+	if (booking.status === 'confirmed') {
+		const paid = attempts.findLast((attempt) => attempt.status === 'captured' || attempt.status === 'authorized');
+		if (paid) {
+			return paid;
+		}
+	}
+	return attempts.at(-1);
+}
+
 class RostersService {
 	async getRoster(trialClassId: string): Promise<RosterDto> {
 		const trialClass = await TrialClass.findByPk(trialClassId);
@@ -37,7 +52,7 @@ class RostersService {
 				parentName: booking.student!.parent!.name,
 				parentEmail: booking.student!.parent!.email,
 				confirmedAt: booking.confirmedAt!.toISOString(),
-				paymentStatus: booking.paymentAttempts?.at(-1)?.status ?? null,
+				paymentStatus: paymentOfRecord(booking)?.status ?? null,
 			}));
 
 		const notOnRoster: NotOnRosterEntryDto[] = bookings

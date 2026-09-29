@@ -220,3 +220,33 @@ describe('api client sign-in and sign-out', () => {
 		assert.deepEqual(ends, ['signed_out']);
 	});
 });
+
+describe('api client with several tabs or requests in flight', () => {
+	test('should retry with the token another request already refreshed instead of refreshing again', async () => {
+		let releaseLate: () => void = () => undefined;
+		const lateAnswer = new Promise<void>((resolve) => {
+			releaseLate = resolve;
+		});
+		const { api, calls } = setup(async (call) => {
+			if (call.url === '/api/auth/refresh') {
+				return ok(session('new-token'));
+			}
+			if (call.headers.Authorization === 'Bearer old-token') {
+				if (call.url === '/api/students') {
+					await lateAnswer;
+				}
+				return fail(401, 'TOKEN_EXPIRED', 'Access token has expired');
+			}
+			return ok([]);
+		});
+
+		// Sent with the old token; its 401 only arrives after the other request refreshed.
+		const late = api.listStudents();
+		await api.listTrialClasses();
+		releaseLate();
+
+		assert.deepEqual(await late, []);
+		assert.equal(calls.filter((call) => call.url === '/api/auth/refresh').length, 1);
+		assert.equal(calls.at(-1)?.headers.Authorization, 'Bearer new-token');
+	});
+});

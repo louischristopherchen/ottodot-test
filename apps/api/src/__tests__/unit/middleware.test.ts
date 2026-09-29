@@ -127,9 +127,12 @@ describe('access control', () => {
 		assert.deepEqual(own.errors, [undefined]);
 	});
 
-	test('should group IPv6 clients by /64 for rate limiting', () => {
-		assert.equal(ipKey('203.0.113.7'), '203.0.113.7');
-		assert.equal(ipKey('2001:db8:1:2:aaaa:bbbb:cccc:dddd'), '2001:db8:1:2::/64');
+	test('should group IPv6 clients by /64 for rate limiting, compressed forms included', () => {
+		const key = (ip: string) => ipKey({ ip } as Request);
+		assert.equal(key('203.0.113.7'), '203.0.113.7');
+		const sameBlock = ['2001:db8:0:0:1::1', '2001:db8::2', '2001:db8:0:0:ffff::', '2001:0db8:0000:0000:aaaa:bbbb:cccc:dddd'].map(key);
+		assert.equal(new Set(sameBlock).size, 1, `one key per /64, got ${sameBlock.join(', ')}`);
+		assert.notEqual(key('2001:db8:0:1::1'), key('2001:db8::1'));
 	});
 });
 

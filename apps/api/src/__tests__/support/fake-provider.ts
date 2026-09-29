@@ -14,7 +14,8 @@ interface Gate {
 	released: PromiseWithResolvers<void>;
 }
 
-type Failure = { transient: boolean; code: string; times: number };
+/** afterCapturing: the capture happens at the provider, then the answer is an error (a lost response). */
+type Failure = { transient: boolean; code: string; times: number; afterCapturing?: boolean };
 
 /**
  * In-memory provider for integration tests. It can pause one booking's authorization
@@ -87,6 +88,9 @@ export class FakePaymentProvider implements PaymentProvider {
 		this.calls.capture += 1;
 		if (this.captureFailure && this.captureFailure.times > 0) {
 			this.captureFailure.times -= 1;
+			if (this.captureFailure.afterCapturing) {
+				this.transition(providerRef, 'captured');
+			}
 			throw new ProviderError('injected capture failure', this.captureFailure);
 		}
 		this.transition(providerRef, 'captured');

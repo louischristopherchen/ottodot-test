@@ -15,8 +15,6 @@ export class User extends Model<InferAttributes<User>, InferCreationAttributes<U
 	declare name: string;
 	declare role: Role;
 	declare passwordHash: string;
-	declare failedLoginCount: CreationOptional<number>;
-	declare lockedUntil: CreationOptional<Date | null>;
 	declare createdAt: CreationOptional<Date>;
 	declare updatedAt: CreationOptional<Date>;
 }
@@ -28,8 +26,6 @@ User.init(
 		name: { type: DataTypes.STRING(120), allowNull: false },
 		role: { type: DataTypes.ENUM('parent', 'staff'), allowNull: false },
 		passwordHash: { type: DataTypes.STRING(100), allowNull: false },
-		failedLoginCount: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
-		lockedUntil: { type: DataTypes.DATE, allowNull: true },
 		createdAt: DataTypes.DATE,
 		updatedAt: DataTypes.DATE,
 	},

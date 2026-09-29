@@ -114,6 +114,11 @@ describe('last-seat race', () => {
 		assert.deepEqual(results.map((result) => result.body.data.outcome).sort(), ['already_confirmed', 'confirmed']);
 		assert.deepEqual((await attemptStatuses(bookingId)).sort(), ['captured', 'voided']);
 		assert.equal(await confirmedCount(h.ids.classes.fractions), 4);
+
+		// The roster shows the attempt that paid, not the voided duplicate.
+		const roster = await h.request('GET', `/api/staff/trial-classes/${h.ids.classes.fractions}/roster`, { token: h.tokens.staff });
+		const zara = roster.body.data.confirmed.find((entry: { studentName: string }) => entry.studentName === 'Zara Rahman');
+		assert.equal(zara.paymentStatus, 'captured');
 	});
 
 	test('should make the seat claim wait while another transaction holds the class row lock', async () => {

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { after, afterEach, beforeEach, describe, test } from 'node:test';
 
 import { sequelize } from '../../config/database.js';
-import { PaymentAttempt } from '../../models/index.js';
+import { IdempotencyKey, PaymentAttempt } from '../../models/index.js';
+import { requestFingerprint } from '../../modules/payments/idempotency.service.js';
 import { attemptStatuses, closePool, confirmedCount, startHarness, type Harness } from '../support/harness.js';
 
 let h: Harness;
@@ -129,6 +130,25 @@ describe('paying for a booking', () => {
 		h.provider.release(bookingId);
 		assert.equal((await first).body.data.outcome, 'confirmed');
 		assert.equal(h.provider.calls.authorize, 1);
+	});
+
+	test('should let a retry take over an Idempotency-Key left in progress by a request that died', async () => {
+		const bookingId = await book(h.tokens.aisha, h.ids.students.zara, h.ids.classes.float);
+		const key = 'e5f6a7b8-c9d0-4e1f-8a2b-3c4d5e6f7a8b';
+		await IdempotencyKey.create({
+			userId: h.ids.parents.aisha,
+			key,
+			requestHash: requestFingerprint({ bookingId, paymentMethod: 'pm_card_visa' }),
+			state: 'in_progress',
+		});
+
+		const fresh = await pay(h.tokens.aisha, bookingId, 'pm_card_visa', key);
+		assert.equal(fresh.status, 409, 'a key still within the window is treated as running');
+
+		await sequelize.query("UPDATE idempotency_keys SET updated_at = now() - interval '10 minutes'");
+		const takenOver = await pay(h.tokens.aisha, bookingId, 'pm_card_visa', key);
+		assert.equal(takenOver.status, 200);
+		assert.equal(takenOver.body.data.outcome, 'confirmed');
 	});
 
 	test('should not touch the card when the booking is already confirmed', async () => {

@@ -22,7 +22,7 @@ an env file cannot change them.
 
 | File | Purpose |
 | --- | --- |
-| `vps-setup.sh` | Idempotent provisioning of a fresh Ubuntu 22.04/24.04/26.04 server. Run as root. |
+| `vps-setup.sh` | Idempotent provisioning of a fresh Ubuntu 22.04/24.04/26.04 server. Run as root, from a root-owned copy. |
 | `nginx.conf` | Plain-HTTP vhost. Installed until a certificate exists. |
 | `nginx-tls.conf` | HTTPS vhost with a port 80 redirect. Installed once `certbot certonly` succeeds. |
 | `snippets/trial-booking-app.conf` | Static root, gzip, cache rules, every `location`. Shared by both vhosts. |
@@ -75,20 +75,39 @@ templates each run, checked with `nginx -t`, and rolled back if the check fails.
 Re-run it after changing anything in `.deploy/`: the deploy workflow does not
 touch nginx.
 
+Always run a root-owned copy (as above), never `$DEPLOY_PATH/.deploy/vps-setup.sh`:
+the deploy user owns that copy, and the script refuses to run from it. For the
+same reason the script never writes, chmods or chowns as root inside the deploy
+user's home or the deploy root. It does that work as the deploy user, refuses to
+follow a symlink the deploy user could have planted there, and writes the PM2
+boot unit as a static file instead of running the user's `pm2` binary as root.
+
 ## GitHub settings
 
-Settings > Secrets and variables > Actions. The deploy job runs in the
-`production` environment, so you can also add required reviewers there.
+The deploy job runs in the `production` environment. Configure it before the
+first deploy, under Settings > Environments > production:
+
+1. **Deployment branches and tags:** "Selected branches and tags", add one rule
+   for the branch `main`, and no tag rules. `deploy.yml` also refuses any ref
+   but `refs/heads/main`, but that check lives in the workflow file of the ref
+   being run, so someone who can push a branch could edit it away there. The
+   environment rule is enforced by GitHub and cannot be.
+2. **Required reviewers:** add at least one person (and tick "Prevent
+   self-review" if more than one person has access). Each deploy then waits for
+   an approval after CI passes.
+3. **Environment secrets and variables:** store the values below here, not as
+   repository secrets. Repository secrets reach workflows on every branch;
+   environment secrets only reach jobs that pass the two rules above.
 
 | Name | Kind | Value |
 | --- | --- | --- |
-| `VPS_HOST` | secret | Server IP or DNS name. |
-| `VPS_USER` | secret | `deploy` (the `APP_USER` of `vps-setup.sh`). |
-| `VPS_PORT` | secret | SSH port. Optional, defaults to 22. |
-| `VPS_SSH_KEY` | secret | Private half of the deploy key (the whole file). |
-| `VPS_HOST_KEY` | secret | The server's host key as a known_hosts line. The deploy fails closed without it. |
-| `DEPLOY_PATH` | variable | The deploy root, e.g. `/home/deploy/trial-booking`. |
-| `SHOW_DEMO_ACCOUNTS` | variable | Optional. `true` shows the seeded demo logins on the login page. |
+| `VPS_HOST` | environment secret | Server IP or DNS name. |
+| `VPS_USER` | environment secret | `deploy` (the `APP_USER` of `vps-setup.sh`). |
+| `VPS_PORT` | environment secret | SSH port. Optional, defaults to 22. |
+| `VPS_SSH_KEY` | environment secret | Private half of the deploy key (the whole file). |
+| `VPS_HOST_KEY` | environment secret | The server's host key as a known_hosts line. The deploy fails closed without it. |
+| `DEPLOY_PATH` | environment variable | The deploy root, e.g. `/home/deploy/trial-booking`. |
+| `SHOW_DEMO_ACCOUNTS` | environment variable | Optional. `true` shows the seeded demo logins on the login page. |
 
 `VPS_HOST_KEY` must start with the exact `VPS_HOST` value, plus the port in
 brackets when it is not 22:
@@ -128,9 +147,11 @@ which lists every variable with its default.
 | `PORT` | `4001` | API port. nginx and the deploy health check use 4001; pinned by `ecosystem.config.cjs`. |
 | `BIND_HOST` | `127.0.0.1` | Listen on loopback only. Pinned by `ecosystem.config.cjs`. |
 | `DATABASE_URL` | `postgres://trial_booking_app:<pw>@127.0.0.1:5432/trial_booking` | Postgres connection, used by the API, the worker and migrations. |
+| `DB_POOL_MAX` | default (10) | Connections per process. The API and the worker each hold a pool. |
 | `JWT_SECRET` | 64 hex chars (`openssl rand -hex 32`) | Signs access tokens (HS256). 32+ characters. |
 | `JWT_ACCESS_TTL` | `30m` | Access token lifetime. |
-| `REFRESH_TTL_DAYS` | `7` | Refresh token (`tb_refresh` cookie) lifetime. |
+| `REFRESH_TTL_DAYS` | `7` | Refresh token (`tb_refresh` cookie) lifetime. Each refresh rotates it. |
+| `SESSION_MAX_AGE_DAYS` | default (30) | Absolute lifetime of a sign-in. Refresh rotation cannot extend a session past it. |
 | `CORS_ORIGIN` | `https://<your domain>` | Allowed browser origins, comma separated. The SPA is same-origin, so this is the site's own origin. |
 | `COOKIE_SECURE` | `true` | Sets `Secure` on the refresh cookie. `false` only for a plain-HTTP demo, where browsers would drop a secure cookie. |
 | `TRUST_PROXY` | `1` | nginx is one proxy hop, so Express reads the client IP (rate limits) and HTTPS scheme from nginx's headers. |
@@ -141,12 +162,18 @@ which lists every variable with its default.
 | `BCRYPT_COST` | default | bcrypt work factor for password hashes. |
 | `RATE_LIMIT_WINDOW_MS` | default | Window for the per-IP rate limits below. |
 | `RATE_LIMIT_MAX` | default | Requests per window per IP, all of `/api`. |
-| `LOGIN_RATE_LIMIT_MAX` | default | Login attempts per window per IP. |
+| `LOGIN_RATE_LIMIT_MAX` | default (10) | Login attempts per window for one IP and email pair. |
+| `LOGIN_IP_RATE_LIMIT_MAX` | default (20) | Login attempts per window per IP, across all emails. Stops one address trying many accounts. |
+| `LOGIN_EMAIL_RATE_LIMIT_MAX` | default (30) | Login attempts per window per email, across all IPs. Slows distributed guessing against one account. |
 | `PAYMENT_RATE_LIMIT_MAX` | default | Payment attempts per window per IP. |
 | `UNPAID_BOOKING_TTL_MINUTES` | default | After this long the worker expires an unpaid booking. |
 | `WORKER_INTERVAL_MS` | default | How often the worker polls for jobs. |
-| `PAYMENT_JOB_MAX_ATTEMPTS` | default | Retries for a capture or void job before it is marked failed. |
-| `RECONCILE_AFTER_SECONDS` | default | Age at which the worker reconciles a payment attempt stuck in progress. |
+| `PAYMENT_JOB_ALERT_AFTER_ATTEMPTS` | default (5) | Transient capture or void failures retry forever with capped backoff. From this attempt on, each failure is logged at error level: alert on it. (Replaces `PAYMENT_JOB_MAX_ATTEMPTS`; remove that line from an older env file.) |
+| `RECONCILE_AFTER_SECONDS` | default | Age at which the worker reconciles a payment attempt stuck in progress. Must be at least 3 times `PAYMENT_PROVIDER_TIMEOUT_MS`, or the API refuses to start. |
+
+There is no per-account lockout (and no `ACCOUNT_LOCKED` response): the three
+login limiters above replace it, so an attacker cannot lock a parent out by
+failing on purpose.
 
 ### `apps/payments-sandbox/.env`
 
@@ -173,7 +200,8 @@ Run `npm` and `pm2` commands on the server as the deploy user
 
 ## First deploy
 
-1. Provision the server and set the GitHub secrets and variables above.
+1. Provision the server and configure the `production` environment (branch
+   rule, reviewer, secrets and variables) as described above.
 2. Push to `main`, or open Actions > Deploy > Run workflow.
 3. Watch the run: CI, then build, rsync, `npm ci --omit=dev`, migrations,
    `pm2 startOrReload`, health check.
@@ -186,7 +214,8 @@ Merge to `main`. The Deploy workflow runs when `apps/`, `packages/`, the root
 `package.json`/`package-lock.json`, `ecosystem.config.cjs` or the workflow
 itself changed. It:
 
-1. runs the full CI workflow for that commit and stops if any job fails;
+1. runs the full CI workflow for that commit and stops if any job fails,
+   then waits for a required reviewer to approve the `production` deployment;
 2. builds on the runner (`npm ci`, `npm run build`);
 3. rsyncs the checkout, with build output, to `DEPLOY_PATH`, skipping `.git`,
    `node_modules`, `.env*`, `logs/` and test artifacts. Anything else you put in
@@ -217,11 +246,22 @@ release later). Take a [backup](#backups-and-restore) before a destructive one.
 
 ## Seeding demo data
 
-`npm run seed -w @trial-booking/api` runs through `tsx`, a dev dependency that
-the server does not have. Run it from your machine through an SSH tunnel:
+Only for a demo deployment. Every seeded account, the staff account included,
+shares the password published in this repository, so never seed a server that
+real parents use.
+
+`vps-setup.sh` marks the database with
+`COMMENT ON DATABASE trial_booking IS 'environment=production'`. The seed and
+reset scripts (`npm run seed`, `npm run db:reset`) read that comment and refuse
+to touch the database unless `ALLOW_DEMO_SEED=true` is set. The check runs
+against the database itself, so it holds whatever `NODE_ENV` your machine has.
+
+The seed runs through `tsx`, a dev dependency the server does not have, so run
+it from your machine through an SSH tunnel and opt in explicitly:
 
 ```sh
 ssh -N -L 15432:127.0.0.1:5432 <you>@<server> &
+ALLOW_DEMO_SEED=true \
 DATABASE_URL='postgres://trial_booking_app:<pw>@127.0.0.1:15432/trial_booking' \
   npm run seed -w @trial-booking/api
 kill %1
@@ -230,19 +270,16 @@ kill %1
 Use your own SSH login for the tunnel; the `deploy` user only accepts the CI
 key. The password is in `apps/api/.env` on the server. `DATABASE_URL` on the
 command line wins over your local `.env`, which supplies any other variable the
-seed script reads. Pair this with `SHOW_DEMO_ACCOUNTS=true` only for a public
-demo.
+seed script reads. Pair this with `SHOW_DEMO_ACCOUNTS=true` for a public demo.
 
 ## Rollback
 
 Code:
 
-- Durable fix: `git revert <bad commit>` and push to `main`. CI and the deploy
-  run as usual.
-- Faster: tag the last good commit (`git tag rollback-<date> <sha> && git push origin rollback-<date>`),
-  then Actions > Deploy > Run workflow > "Use workflow from" > that tag. The
-  deploy job accepts `main` and tags only. The next push to `main` deploys
-  `main` again, so revert there as well.
+`git revert <bad commit>` and push to `main` (or merge a revert PR). CI and the
+deploy run as usual, and production always matches `main`. Deploys never run
+from a tag or another branch: the workflow refuses them and the `production`
+environment rule blocks them.
 
 Database: rolling code back does not undo migrations. If the bad release added
 a migration the old code cannot live with, undo it **before** deploying the old
@@ -296,11 +333,27 @@ pm2 restart trial-booking-api
 curl -sf http://127.0.0.1:4001/health/ready
 ```
 
-Access tokens signed with the old secret stop verifying at once. Refresh tokens
-are opaque values stored in the database, not JWTs, so the SPA's next
-`POST /api/auth/refresh` gets a fresh access token and users stay signed in. If
-you rotate because the secret leaked, also revoke all refresh tokens in the
-database so every session has to log in again.
+Access tokens signed with the old secret stop verifying at once, so every
+request made with one gets a 401. Refresh tokens are random values stored as
+SHA-256 hashes in `sessions`; they do not depend on `JWT_SECRET`, so the SPA's
+next `POST /api/auth/refresh` gets a fresh access token and users stay signed
+in. Rotation limits what a leaked secret can forge, but it does not end
+sessions. If the secret leaked, also sign everyone out:
+
+```sh
+sudo -u postgres psql -d trial_booking -c \
+  "UPDATE sessions SET revoked_at = now(), revoked_reason = 'logout' WHERE revoked_at IS NULL"
+```
+
+Every access token names its session (`sid`) and the API checks it on each
+request, so revoked sessions stop working at once, not after 30 minutes.
+
+## Sign out everywhere
+
+`POST /api/auth/logout-all` (with a valid access token) revokes every session
+of the calling user, on every device. Point a parent or staff member at it when
+they lose a device or suspect someone else signed in. The SQL above does the
+same for all users at once.
 
 ## Backups and restore
 
@@ -331,13 +384,17 @@ sudo -u postgres pg_restore --no-owner --role=trial_booking_app \
 sudo -u postgres psql -c 'ALTER DATABASE trial_booking RENAME TO trial_booking_broken'
 sudo -u postgres psql -c 'ALTER DATABASE trial_booking_restore RENAME TO trial_booking'
 sudo -u postgres psql -c 'REVOKE ALL ON DATABASE trial_booking FROM PUBLIC'
+sudo -u postgres psql -c "COMMENT ON DATABASE trial_booking IS 'environment=production'"
 
 sudo -iu deploy bash -c 'cd "$DEPLOY_PATH" && NODE_ENV=production npm run migrate -w @trial-booking/api'
 sudo -iu deploy pm2 start trial-booking-api trial-booking-worker
 curl -sf http://127.0.0.1:4001/health/ready
 ```
 
-The migrate step brings an older dump up to the current schema.
+The migrate step brings an older dump up to the current schema. The `COMMENT`
+line matters: `pg_restore` into a new database does not carry the database
+comment over, and without it the seed guard would no longer recognise
+production. Re-running `vps-setup.sh` sets it again too.
 Drop `trial_booking_broken` once you are satisfied.
 
 ## Changing the server

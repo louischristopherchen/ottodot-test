@@ -203,9 +203,12 @@ export function createApi(options: ApiClientOptions) {
 			if (!canRefresh) {
 				throw error;
 			}
-			const session = await refreshSession();
+			// If another request already refreshed while this one was in flight, its token is
+			// newer than the one this request used: retry with it instead of rotating again.
+			const current = options.getAccessToken();
+			const accessToken = current && current !== token ? current : (await refreshSession()).accessToken;
 			// Same headers (Idempotency-Key included) so the server treats it as the same request.
-			return send<T>(path, method, { ...headers, Authorization: `Bearer ${session.accessToken}` }, body, init.signal);
+			return send<T>(path, method, { ...headers, Authorization: `Bearer ${accessToken}` }, body, init.signal);
 		}
 	}
 

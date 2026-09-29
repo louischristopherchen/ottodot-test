@@ -52,6 +52,17 @@ class AuthController {
 		}
 	};
 
+	logoutEverywhere = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
+		try {
+			const user = requireUser(req);
+			const sessions = await authService.logoutEverywhere(user.id);
+			clearRefreshCookie(res);
+			res.json({ success: true, data: { loggedOut: true, sessions } });
+		} catch (error) {
+			next(error);
+		}
+	};
+
 	me = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
 		try {
 			const user = requireUser(req);

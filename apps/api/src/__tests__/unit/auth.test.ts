@@ -4,7 +4,7 @@ import { describe, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 
 import { durationToSeconds } from '../../config/env.js';
-import { hashPassword, lockedUntilAfter, verifyPassword } from '../../modules/auth/passwords.js';
+import { hashPassword, verifyPassword } from '../../modules/auth/passwords.js';
 import {
 	JWT_AUDIENCE,
 	JWT_ISSUER,
@@ -15,7 +15,7 @@ import {
 } from '../../modules/auth/tokens.js';
 
 const SECRET = 'unit-test-secret-with-at-least-32-characters';
-const claims = { sub: 'user-1', email: 'aisha.rahman@example.com', role: 'parent' as const, sid: 'session-1' };
+const claims = { sub: 'user-1', email: 'aisha.rahman@example.com', role: 'parent' as const, sid: 'session-1', fam: 'family-1' };
 
 describe('access tokens', () => {
 	test('should round-trip the claims when the token is valid', () => {
@@ -28,6 +28,12 @@ describe('access tokens', () => {
 		assert.throws(() => verifyAccessToken(foreign, SECRET), { code: 'UNAUTHORIZED' });
 		const wrongAudience = jwt.sign({ ...claims, type: 'access' }, SECRET, { issuer: JWT_ISSUER, audience: 'other' });
 		assert.throws(() => verifyAccessToken(wrongAudience, SECRET), { code: 'UNAUTHORIZED' });
+	});
+
+	test('should reject a token without a session family', () => {
+		const { fam: _fam, ...withoutFamily } = claims;
+		const legacy = jwt.sign({ ...withoutFamily, type: 'access' }, SECRET, { issuer: JWT_ISSUER, audience: JWT_AUDIENCE });
+		assert.throws(() => verifyAccessToken(legacy, SECRET), { code: 'UNAUTHORIZED' });
 	});
 
 	test('should reject a token that is not an access token', () => {
@@ -66,18 +72,6 @@ describe('passwords', () => {
 
 	test('should return false and still compare when the account does not exist', async () => {
 		assert.equal(await verifyPassword('anything', null), false);
-	});
-
-	test('should lock for longer the more attempts fail in a row', () => {
-		const now = new Date('2026-10-05T01:00:00.000Z');
-		const minutes = (failed: number) => {
-			const until = lockedUntilAfter(failed, now);
-			return until ? (until.getTime() - now.getTime()) / 60_000 : 0;
-		};
-		assert.equal(minutes(4), 0);
-		assert.equal(minutes(5), 1);
-		assert.equal(minutes(6), 5);
-		assert.equal(minutes(9), 15);
 	});
 });
 

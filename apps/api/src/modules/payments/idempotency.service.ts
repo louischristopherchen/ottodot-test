@@ -13,6 +13,9 @@ export interface StoredResponse {
 /** Keys are kept for a day: long enough for any client retry. */
 const RETENTION_MS = 86_400_000;
 
+/** A request that died mid-flight leaves its key in progress; after this long a retry may take it over. */
+export const STALE_IN_PROGRESS_MS = 5 * 60_000;
+
 export function requestFingerprint(parts: Record<string, unknown>): string {
 	return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
@@ -41,6 +44,20 @@ class IdempotencyService {
 			throw ApiError.of('IDEMPOTENCY_KEY_REUSED', 'This Idempotency-Key was already used for a different request');
 		}
 		if (existing.state === 'in_progress') {
+			// Conditional update: of several retries arriving together, only one takes the key over.
+			const [takenOver] = await IdempotencyKey.update(
+				{ requestHash },
+				{
+					where: {
+						id: existing.id,
+						state: 'in_progress',
+						updatedAt: { [Op.lt]: new Date(Date.now() - STALE_IN_PROGRESS_MS) },
+					},
+				},
+			);
+			if (takenOver === 1) {
+				return null;
+			}
 			throw ApiError.of('REQUEST_IN_PROGRESS', 'The same payment request is still being processed');
 		}
 		return { status: existing.responseStatus!, body: existing.responseBody };

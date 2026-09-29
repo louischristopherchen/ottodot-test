@@ -65,24 +65,121 @@ describe('background jobs', () => {
 		assert.equal((await job.reload()).status, 'done');
 	});
 
-	test('should release the seat and void the hold when the capture keeps failing', async () => {
+	test('should keep the seat and keep retrying while the capture keeps failing briefly', async () => {
 		h.provider.failCapture({ transient: true, code: 'provider_error', times: 99 });
 		const bookingId = await book(h.tokens.aisha, h.ids.students.zara, h.ids.classes.fractions);
 		await pay(h.tokens.aisha, bookingId);
-		assert.equal(await confirmedCount(h.ids.classes.fractions), 4);
 
-		// PAYMENT_JOB_MAX_ATTEMPTS is 3 in tests: the request made attempt 1.
-		for (let run = 0; run < 2; run += 1) {
+		// PAYMENT_JOB_ALERT_AFTER_ATTEMPTS is 3 in tests; the job goes well past it.
+		for (let run = 0; run < 5; run += 1) {
 			await elapseBackoff();
 			await runJobsOnce();
 		}
 
-		const booking = (await Booking.findByPk(bookingId))!;
-		const attempt = (await PaymentAttempt.findOne({ where: { bookingId } }))!;
-		assert.equal(booking.status, 'payment_failed');
-		assert.equal(attempt.status, 'voided');
-		assert.equal(attempt.failureCode, 'capture_failed');
+		const job = (await PaymentJob.findOne({ where: { kind: 'capture' } }))!;
+		assert.equal(job.status, 'pending', 'an outage never gives the seat away');
+		assert.equal(job.attempts, 6);
+		assert.equal((await Booking.findByPk(bookingId))!.status, 'confirmed');
+		assert.equal(await confirmedCount(h.ids.classes.fractions), 4);
+	});
+
+	test('should keep the seat when a capture went through but its response was lost', async () => {
+		h.provider.failCapture({ transient: true, code: 'provider_timeout', times: 1, afterCapturing: true });
+		const bookingId = await book(h.tokens.aisha, h.ids.students.zara, h.ids.classes.fractions);
+		await pay(h.tokens.aisha, bookingId);
+
+		await elapseBackoff();
+		await runJobsOnce();
+
+		assert.equal((await PaymentAttempt.findOne({ where: { bookingId } }))!.status, 'captured');
+		assert.equal((await Booking.findByPk(bookingId))!.status, 'confirmed');
+	});
+
+	test('should keep the seat when the provider refuses a capture that had in fact gone through', async () => {
+		h.provider.failCapture({ transient: false, code: 'authorization_captured', times: 1, afterCapturing: true });
+		const bookingId = await book(h.tokens.aisha, h.ids.students.zara, h.ids.classes.fractions);
+
+		const result = await pay(h.tokens.aisha, bookingId);
+
+		assert.equal(result.body.data.outcome, 'confirmed');
+		assert.equal(result.body.data.paymentAttempt.status, 'captured');
+		assert.equal(h.provider.calls.void, 0, 'a captured payment is never voided');
+	});
+
+	test('should leave the job pending if releasing the seat fails, and release it on a later run', async () => {
+		h.provider.failCapture({ transient: true, code: 'provider_error', times: 1 });
+		const bookingId = await book(h.tokens.aisha, h.ids.students.zara, h.ids.classes.fractions);
+		await pay(h.tokens.aisha, bookingId);
+		const job = (await PaymentJob.findOne({ where: { kind: 'capture' } }))!;
+
+		// The next capture is refused for good, and the release transaction breaks halfway.
+		h.provider.failCapture({ transient: false, code: 'capture_declined', times: 99 });
+		await sequelize.query(`
+			CREATE FUNCTION test_break_release() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN RAISE EXCEPTION 'simulated failure'; END $$;
+			CREATE TRIGGER test_break_release BEFORE UPDATE OF status ON bookings
+				FOR EACH ROW WHEN (NEW.status = 'payment_failed') EXECUTE FUNCTION test_break_release();
+		`);
+		try {
+			await elapseBackoff();
+			await assert.rejects(paymentJobsService.runJob(job.id), /simulated failure/);
+			assert.equal((await job.reload()).status, 'pending', 'nothing was half written');
+			assert.equal((await Booking.findByPk(bookingId))!.status, 'confirmed');
+		} finally {
+			await sequelize.query('DROP TRIGGER test_break_release ON bookings; DROP FUNCTION test_break_release()');
+		}
+
+		// Once the lease expires the worker picks the job up again and finishes the release.
+		await sequelize.query("UPDATE payment_jobs SET locked_until = now() - interval '1 second', run_after = now() - interval '1 second'");
+		await runJobsOnce();
+
+		assert.equal((await job.reload()).status, 'failed');
+		assert.equal((await Booking.findByPk(bookingId))!.status, 'payment_failed');
+		assert.equal((await PaymentAttempt.findOne({ where: { bookingId } }))!.status, 'voided');
 		assert.equal(await confirmedCount(h.ids.classes.fractions), 3);
+	});
+
+	test('should not take a seat on an attempt that reconciliation settled while its request was stalled', async () => {
+		const bookingId = await book(h.tokens.aisha, h.ids.students.zara, h.ids.classes.fractions);
+		h.provider.hold(bookingId);
+		const payment = pay(h.tokens.aisha, bookingId);
+		await h.provider.waitForAuthorization(bookingId);
+
+		// The request is stuck long enough for reconciliation to find nothing at the provider.
+		await sequelize.query("UPDATE payment_attempts SET updated_at = now() - interval '10 minutes'");
+		await reconcilePaymentAttempts();
+		h.provider.release(bookingId);
+		const result = await payment;
+
+		assert.equal(result.body.data.outcome, 'payment_declined');
+		assert.equal(result.body.data.booking.status, 'payment_failed');
+		assert.equal(await confirmedCount(h.ids.classes.fractions), 3, 'no seat was taken');
+		const attempt = (await PaymentAttempt.findOne({ where: { bookingId } }))!;
+		assert.equal(h.provider.statusOf(attempt.providerRef!), 'voided', 'the late authorization was released');
+	});
+
+	test('should not expire a booking whose payment starts while the expiry job runs', async () => {
+		const bookingId = await book(h.tokens.aisha, h.ids.students.zara, h.ids.classes.float);
+		await sequelize.query("UPDATE bookings SET updated_at = now() - interval '2 hours' WHERE id = :id", {
+			replacements: { id: bookingId },
+		});
+
+		// What payment step 1 does: lock the booking, touch it, record a processing attempt.
+		const step1 = await sequelize.transaction();
+		const booking = (await Booking.findByPk(bookingId, { lock: step1.LOCK.UPDATE, transaction: step1 }))!;
+		booking.changed('updatedAt', true);
+		await booking.save({ transaction: step1 });
+		await PaymentAttempt.create(
+			{ bookingId, amountCents: 2000, currency: 'SGD', paymentMethod: 'pm_card_visa', status: 'processing' },
+			{ transaction: step1 },
+		);
+
+		const expiry = expireUnpaidBookings();
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		await step1.commit();
+		await expiry;
+
+		assert.equal((await Booking.findByPk(bookingId))!.status, 'pending_payment');
 	});
 
 	test('should run a job once when two runners reach it at the same moment', async () => {
@@ -154,7 +251,8 @@ describe('background jobs', () => {
 	});
 
 	test('should purge expired sessions and old idempotency keys', async () => {
-		await sequelize.query("UPDATE sessions SET expires_at = now() - interval '1 minute' WHERE user_id = :id", {
+		// Sessions are kept until their whole sign-in expired, so old tokens are still recognised as reuse.
+		await sequelize.query("UPDATE sessions SET family_expires_at = now() - interval '2 days' WHERE user_id = :id", {
 			replacements: { id: h.ids.parents.ben },
 		});
 		await IdempotencyKey.create({ userId: h.ids.parents.ben, key: 'old-key-000001', requestHash: 'x'.repeat(64), state: 'completed' });

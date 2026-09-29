@@ -19,8 +19,24 @@ export function lastPaymentAttempt(booking: BookingDto): PaymentAttemptDto | nul
 	return booking.paymentAttempts.at(-1) ?? null;
 }
 
+/**
+ * The attempt that paid for a confirmed booking, or else the latest one. A double click
+ * can leave a later, voided attempt next to the one that was captured.
+ */
+export function paymentOfRecord(booking: BookingDto): PaymentAttemptDto | null {
+	if (booking.status === 'confirmed') {
+		const paid = booking.paymentAttempts.findLast(
+			(attempt) => attempt.status === 'captured' || attempt.status === 'authorized',
+		);
+		if (paid) {
+			return paid;
+		}
+	}
+	return lastPaymentAttempt(booking);
+}
+
 export function bookingPaymentText(booking: BookingDto): string {
-	const attempt = lastPaymentAttempt(booking);
+	const attempt = paymentOfRecord(booking);
 	return paymentStatusText(attempt?.status ?? null, attempt?.failureCode ?? null);
 }
 

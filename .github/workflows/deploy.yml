@@ -10,7 +10,8 @@ on:
       - 'package-lock.json'
       - 'ecosystem.config.cjs'
       - '.github/workflows/deploy.yml'
-  # Manual runs: redeploy, or roll back by picking an older tag in "Use workflow from".
+  # Manual runs redeploy the current main. Roll back with a revert commit on
+  # main, never by dispatching from a tag or branch (the job below refuses).
   workflow_dispatch:
 
 # Read-only token. The only credentials this workflow uses are the SSH secrets.
@@ -31,13 +32,24 @@ jobs:
   deploy:
     name: Build and deploy
     needs: ci
-    # Manual runs may ship main or a tag (rollback), never a feature branch.
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    # Only main reaches production, whatever the trigger: a pushed tag or a
+    # branch picked in "Use workflow from" could point at any commit. This
+    # check lives in the workflow file of the ref being run, so the real
+    # control is the production environment's branch rule (main only), which
+    # also keeps the VPS_* environment secrets away from other refs.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 15
 
     steps:
+      - name: Refuse anything but main
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Deploys only run from refs/heads/main, not ${GITHUB_REF}."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 

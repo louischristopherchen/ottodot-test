@@ -15,8 +15,14 @@ export interface AccessTokenClaims {
 	sub: string;
 	email: string;
 	role: Role;
-	/** Session id, checked against the sessions table on every request. */
+	/** Session the token was issued for. */
 	sid: string;
+	/**
+	 * Session family (one sign-in). A token stays valid while its family has a live
+	 * session, so a refresh in one tab does not cut off the other tabs, while logout and
+	 * refresh-token reuse detection, which revoke the whole family, end every token at once.
+	 */
+	fam: string;
 }
 
 export function signAccessToken(
@@ -43,10 +49,10 @@ export function verifyAccessToken(token: string, secret = env.JWT_SECRET): Acces
 		throw ApiError.unauthorized('Invalid access token');
 	}
 	const payload = decoded as Partial<AccessTokenClaims> & { type?: string };
-	if (payload.type !== 'access' || !payload.sub || !payload.sid || !payload.role || !payload.email) {
+	if (payload.type !== 'access' || !payload.sub || !payload.sid || !payload.fam || !payload.role || !payload.email) {
 		throw ApiError.unauthorized('Invalid access token');
 	}
-	return { sub: payload.sub, sid: payload.sid, role: payload.role, email: payload.email };
+	return { sub: payload.sub, sid: payload.sid, fam: payload.fam, role: payload.role, email: payload.email };
 }
 
 /** Opaque refresh token. Only its SHA-256 is stored. */

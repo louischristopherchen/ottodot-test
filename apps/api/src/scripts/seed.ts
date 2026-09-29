@@ -159,10 +159,29 @@ export async function seedDemoData(now = new Date()): Promise<SeedIds> {
 	});
 }
 
+/**
+ * Production and staging databases carry a marker in their Postgres comment (set by
+ * .deploy/vps-setup.sh). The guard reads the target database itself, so it also holds
+ * when the script runs from a laptop through an SSH tunnel with a development NODE_ENV.
+ */
+async function targetEnvironment(): Promise<string | null> {
+	const [rows] = await sequelize.query(
+		"SELECT shobj_description(oid, 'pg_database') AS comment FROM pg_database WHERE datname = current_database()",
+	);
+	const comment = (rows as { comment: string | null }[])[0]?.comment ?? '';
+	return /environment=(\w+)/.exec(comment)?.[1] ?? null;
+}
+
 async function main(): Promise<void> {
-	if (env.NODE_ENV === 'production' && process.env.ALLOW_DEMO_SEED !== 'true') {
-		console.error('Refusing to seed demo accounts with a published password in production. Set ALLOW_DEMO_SEED=true to override.');
-		process.exit(1);
+	const target = await targetEnvironment();
+	const protectedTarget = ['production', 'staging'].includes(target ?? env.NODE_ENV);
+	if (protectedTarget && process.env.ALLOW_DEMO_SEED !== 'true') {
+		console.error(
+			`Refusing to seed or reset a ${target ?? env.NODE_ENV} database with demo accounts that share a published password. ` +
+				'Set ALLOW_DEMO_SEED=true only for a demo deployment.',
+		);
+		process.exitCode = 1;
+		return;
 	}
 	const reset = process.argv.includes('--reset');
 	if (reset) {

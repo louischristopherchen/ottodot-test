@@ -20,9 +20,9 @@ export interface AuthRequest extends Request {
 }
 
 /**
- * Verifies the bearer token, then checks that its session is still alive and reloads
- * the user. Two primary-key lookups per request, so logout and refresh-token reuse
- * detection take effect at once instead of when the access token expires.
+ * Verifies the bearer token, then checks that its sign-in (session family) still has a
+ * live session and reloads the user. Two indexed lookups per request, so logout and
+ * refresh-token reuse detection take effect at once instead of when the token expires.
  */
 export async function authMiddleware(req: AuthRequest, _res: Response, next: NextFunction): Promise<void> {
 	try {
@@ -32,8 +32,15 @@ export async function authMiddleware(req: AuthRequest, _res: Response, next: Nex
 		}
 		const payload = verifyAccessToken(header.slice(7));
 
+		const now = new Date();
 		const session = await Session.findOne({
-			where: { id: payload.sid, userId: payload.sub, revokedAt: null, expiresAt: { [Op.gt]: new Date() } },
+			where: {
+				familyId: payload.fam,
+				userId: payload.sub,
+				revokedAt: null,
+				expiresAt: { [Op.gt]: now },
+				familyExpiresAt: { [Op.gt]: now },
+			},
 			attributes: ['id'],
 		});
 		if (!session) {
@@ -44,7 +51,7 @@ export async function authMiddleware(req: AuthRequest, _res: Response, next: Nex
 			throw ApiError.unauthorized();
 		}
 
-		req.user = { id: user.id, email: user.email, name: user.name, role: user.role, sessionId: session.id };
+		req.user = { id: user.id, email: user.email, name: user.name, role: user.role, sessionId: payload.sid };
 		next();
 	} catch (error) {
 		next(error);

@@ -4,7 +4,7 @@ import { after, afterEach, beforeEach, describe, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 
 import { sequelize } from '../../config/database.js';
-import { REFRESH_REUSE_GRACE_MS } from '../../modules/auth/auth.service.js';
+import { REFRESH_REUSE_GRACE_MS, authService } from '../../modules/auth/auth.service.js';
 import { DEMO_PASSWORD } from '../../scripts/seed.js';
 import { closePool, startHarness, type Harness } from '../support/harness.js';
 
@@ -55,14 +55,59 @@ describe('authentication', () => {
 		assert.deepEqual(unknown.body, wrong.body);
 	});
 
-	test('should lock the account after five failed attempts, even for the right password', async () => {
-		for (let attempt = 0; attempt < 5; attempt += 1) {
-			assert.equal((await login('ben.carter@example.com', 'wrong')).status, 401);
+	test("should still let the parent in after a stranger's failed attempts, so nobody can be locked out", async () => {
+		for (let attempt = 0; attempt < 6; attempt += 1) {
+			const failed = await login('ben.carter@example.com', 'wrong');
+			assert.equal(failed.status, 401);
+			assert.equal(failed.body.error.code, 'INVALID_CREDENTIALS');
 		}
-		const locked = await login('ben.carter@example.com');
+		assert.equal((await login('ben.carter@example.com')).status, 200);
+	});
 
-		assert.equal(locked.status, 429);
-		assert.equal(locked.body.error.code, 'ACCOUNT_LOCKED');
+	test('should keep other tabs signed in when one tab refreshes', async () => {
+		const first = await login();
+		const tabOneToken = first.body.data.accessToken;
+
+		const rotated = await refresh(refreshCookieFrom(first.headers));
+		assert.equal(rotated.status, 200);
+
+		assert.equal((await h.request('GET', '/api/bookings', { token: tabOneToken })).status, 200);
+		assert.equal((await h.request('GET', '/api/bookings', { token: rotated.body.data.accessToken })).status, 200);
+	});
+
+	test('should end every sign-in of the user when signing out everywhere', async () => {
+		const laptop = await login();
+		const phone = await login();
+
+		const response = await h.request('POST', '/api/auth/logout-all', { token: laptop.body.data.accessToken });
+		assert.equal(response.status, 200);
+
+		for (const device of [laptop, phone]) {
+			assert.equal((await h.request('GET', '/api/auth/me', { token: device.body.data.accessToken })).status, 401);
+			assert.equal((await refresh(refreshCookieFrom(device.headers))).status, 401);
+		}
+	});
+
+	test('should not let refreshing extend a sign-in past its maximum age', async () => {
+		const cookie = refreshCookieFrom((await login()).headers)!;
+		await sequelize.query("UPDATE sessions SET family_expires_at = now() - interval '1 minute'");
+
+		assert.equal((await refresh(cookie)).status, 401);
+	});
+
+	test('should still detect reuse of a token that was rotated days ago', async () => {
+		const stolen = refreshCookieFrom((await login()).headers)!;
+		const current = refreshCookieFrom((await refresh(stolen)).headers)!;
+		await sequelize.query("UPDATE sessions SET revoked_at = now() - interval '2 days' WHERE revoked_reason = 'rotated'");
+		await authService.purgeSessions();
+
+		assert.equal((await refresh(stolen)).status, 401);
+		assert.equal((await refresh(current)).status, 401, 'the family was revoked');
+	});
+
+	test('should mark API responses as not cacheable', async () => {
+		const response = await h.request('GET', '/api/trial-classes', { token: h.tokens.aisha });
+		assert.equal(response.headers.get('cache-control'), 'no-store');
 	});
 
 	test('should rotate the refresh token and accept the new one', async () => {
@@ -128,7 +173,7 @@ describe('authentication', () => {
 
 		const claims = jwt.decode(token) as jwt.JwtPayload;
 		const expired = jwt.sign(
-			{ sub: claims.sub, email: claims.email, role: claims.role, sid: claims.sid, type: 'access' },
+			{ sub: claims.sub, email: claims.email, role: claims.role, sid: claims.sid, fam: claims.fam, type: 'access' },
 			process.env.JWT_SECRET!,
 			{ expiresIn: -10, issuer: 'trial-booking', audience: 'trial-booking-api' },
 		);

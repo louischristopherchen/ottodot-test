@@ -38,6 +38,11 @@ export function createApp(): express.Express {
 		}
 	});
 
+	// API responses can hold personal data (rosters list parents' emails): never cache them.
+	app.use('/api', (_req, res, next) => {
+		res.setHeader('Cache-Control', 'no-store');
+		next();
+	});
 	app.use('/api', globalLimiter, routes);
 	app.use(notFoundHandler);
 	app.use(errorHandler);

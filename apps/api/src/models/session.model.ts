@@ -20,6 +20,8 @@ export class Session extends Model<InferAttributes<Session>, InferCreationAttrib
 	declare userAgent: CreationOptional<string | null>;
 	declare ip: CreationOptional<string | null>;
 	declare expiresAt: Date;
+	/** Absolute end of the sign-in this session belongs to; rotation cannot pass it. */
+	declare familyExpiresAt: Date;
 	declare revokedAt: CreationOptional<Date | null>;
 	declare revokedReason: CreationOptional<SessionRevokedReason | null>;
 	declare createdAt: CreationOptional<Date>;
@@ -36,6 +38,7 @@ Session.init(
 		userAgent: { type: DataTypes.STRING(255), allowNull: true },
 		ip: { type: DataTypes.STRING(64), allowNull: true },
 		expiresAt: { type: DataTypes.DATE, allowNull: false },
+		familyExpiresAt: { type: DataTypes.DATE, allowNull: false },
 		revokedAt: { type: DataTypes.DATE, allowNull: true },
 		revokedReason: { type: DataTypes.ENUM('logout', 'rotated', 'reuse_detected', 'expired'), allowNull: true },
 		createdAt: DataTypes.DATE,
