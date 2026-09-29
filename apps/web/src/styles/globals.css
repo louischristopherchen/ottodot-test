@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+	:root {
+		--background: 210 20% 98%;
+		--foreground: 222 47% 11%;
+		--card: 0 0% 100%;
+		--card-foreground: 222 47% 11%;
+		--muted: 210 40% 96%;
+		--muted-foreground: 215 19% 35%;
+		--border: 214 32% 89%;
+		--input: 214 32% 80%;
+		--ring: 221 83% 53%;
+		--primary: 221 83% 53%;
+		--primary-foreground: 0 0% 100%;
+		--secondary: 214 32% 91%;
+		--secondary-foreground: 222 47% 16%;
+		--destructive: 0 72% 42%;
+		--destructive-foreground: 0 0% 100%;
+		--success: 142 72% 27%;
+		--success-foreground: 0 0% 100%;
+		--warning: 38 92% 50%;
+		--warning-foreground: 26 83% 14%;
+		--radius: 0.625rem;
+	}
+
+	.dark {
+		--background: 222 47% 7%;
+		--foreground: 210 40% 96%;
+		--card: 222 40% 10%;
+		--card-foreground: 210 40% 96%;
+		--muted: 217 33% 17%;
+		--muted-foreground: 215 20% 70%;
+		--border: 217 33% 20%;
+		--input: 217 33% 28%;
+		--ring: 213 94% 68%;
+		--primary: 213 94% 68%;
+		--primary-foreground: 222 47% 11%;
+		--secondary: 217 33% 20%;
+		--secondary-foreground: 210 40% 96%;
+		--destructive: 0 84% 65%;
+		--destructive-foreground: 222 47% 11%;
+		--success: 142 69% 58%;
+		--success-foreground: 144 61% 10%;
+		--warning: 43 96% 56%;
+		--warning-foreground: 26 83% 14%;
+	}
+
+	* {
+		@apply border-border;
+	}
+
+	body {
+		@apply bg-background font-sans text-foreground antialiased;
+		font-size: 0.9375rem;
+		line-height: 1.5;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+		scroll-behavior: auto !important;
+	}
+}

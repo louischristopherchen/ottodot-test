@@ -1,0 +1,39 @@
+{
+	"name": "@trial-booking/web",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "rspack serve",
+		"build": "NODE_ENV=production rspack build",
+		"typecheck": "tsc --noEmit",
+		"test:unit": "node --import tsx --test \"src/__tests__/*.test.ts\"",
+		"clean": "rm -rf dist"
+	},
+	"dependencies": {
+		"@hookform/resolvers": "^3.10.0",
+		"@tanstack/react-query": "^5.104.0",
+		"@trial-booking/shared": "*",
+		"@trial-booking/ui": "*",
+		"lucide-react": "^1.48.0",
+		"react": "^19.3.0",
+		"react-dom": "^19.3.0",
+		"react-hook-form": "^7.89.0",
+		"react-router": "^8.4.0",
+		"zod": "^3.25.76",
+		"zustand": "^5.0.15"
+	},
+	"devDependencies": {
+		"@rspack/cli": "^1.7.12",
+		"@rspack/core": "^1.7.12",
+		"@types/react": "^19.3.0",
+		"@types/react-dom": "^19.3.0",
+		"autoprefixer": "^10.6.1",
+		"postcss": "^8.5.28",
+		"postcss-loader": "^8.2.1",
+		"tailwindcss": "^3.4.19",
+		"tailwindcss-animate": "^1.0.7",
+		"tsx": "^4.23.15",
+		"typescript": "^5.9.3"
+	}
+}

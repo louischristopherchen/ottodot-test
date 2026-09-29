@@ -1,0 +1,225 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'ecosystem.config.cjs'
+      - '.github/workflows/deploy.yml'
+  # Manual runs: redeploy, or roll back by picking an older tag in "Use workflow from".
+  workflow_dispatch:
+
+# Read-only token. The only credentials this workflow uses are the SSH secrets.
+permissions:
+  contents: read
+
+# One deploy at a time, in push order. A newer run waits instead of cancelling
+# a deploy halfway through `npm ci` or a migration.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Build and deploy
+    needs: ci
+    # Manual runs may ship main or a tag (rollback), never a feature branch.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Build on the runner, not on the server: the server only gets production
+      # dependencies, and a failed build never touches the running release.
+      - name: Build
+        env:
+          SHOW_DEMO_ACCOUNTS: ${{ vars.SHOW_DEMO_ACCOUNTS || 'false' }}
+        run: npm run build
+
+      # -----------------------------------------------------------------------
+      # SSH trust. The host key comes only from the VPS_HOST_KEY secret and the
+      # job fails closed without it. Never ssh-keyscan here: scanning right
+      # before connecting trusts whatever answers, which defeats
+      # StrictHostKeyChecking. See .deploy/README.md for how to capture it.
+      #
+      # Secrets arrive through env:, not ${{ }} inside the script, so their
+      # contents are never parsed as shell.
+      # -----------------------------------------------------------------------
+      - name: Configure SSH
+        id: ssh
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+
+          missing=""
+          for name in VPS_SSH_KEY VPS_HOST_KEY VPS_HOST VPS_USER DEPLOY_PATH; do
+            if [ -z "${!name:-}" ]; then missing="${missing} ${name}"; fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::Not set:${missing}. Secrets go in Settings > Secrets and variables > Actions; DEPLOY_PATH is a variable there."
+            exit 1
+          fi
+
+          # These values end up in ~/.ssh/config and in an rsync --delete target,
+          # so reject anything that is not a plain host, user, port and path.
+          [[ "${VPS_HOST}" =~ ^[A-Za-z0-9.:-]+$ ]] || { echo "::error::VPS_HOST has unexpected characters"; exit 1; }
+          [[ "${VPS_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "::error::VPS_USER has unexpected characters"; exit 1; }
+          [[ "${VPS_PORT}" =~ ^[0-9]+$ ]] || { echo "::error::VPS_PORT must be a number"; exit 1; }
+          if ! [[ "${DEPLOY_PATH}" =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+/?$ ]] || [[ "${DEPLOY_PATH}" == *"/.."* ]]; then
+            echo "::error::DEPLOY_PATH must be an absolute path at least two levels deep, e.g. /home/deploy/trial-booking"
+            exit 1
+          fi
+
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "${VPS_SSH_KEY}" > ~/.ssh/deploy_key
+          printf '%s\n' "${VPS_HOST_KEY}" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vps
+            HostName ${VPS_HOST}
+            User ${VPS_USER}
+            Port ${VPS_PORT}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 15
+          EOF
+
+          echo "Pinned host keys:"
+          ssh-keygen -l -f ~/.ssh/known_hosts
+
+      - name: Sync files to the server
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          target="${DEPLOY_PATH%/}"
+
+          # rsync --delete removes whatever is not in this checkout, so only
+          # sync into a directory that vps-setup.sh already created.
+          if ! ssh vps "test -d $(printf '%q' "${target}")"; then
+            echo "::error::${target} does not exist on the server. Run .deploy/vps-setup.sh first."
+            exit 1
+          fi
+
+          # Excluded paths are also protected from --delete, which keeps the
+          # server's .env files, logs and node_modules in place.
+          # --delay-updates swaps changed files in at the end of the transfer,
+          # which keeps index.html and its hashed bundles in step.
+          rsync -az --delete --delete-after --delay-updates \
+            --include='.env.example' \
+            --exclude='.git/' \
+            --exclude='node_modules/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='logs/' \
+            --exclude='.pgdata/' \
+            --exclude='coverage/' \
+            --exclude='test-results/' \
+            --exclude='playwright-report/' \
+            ./ "vps:${target}/"
+
+      - name: Install, migrate, reload
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          # Quoted delimiter: nothing below is expanded on the runner. The path
+          # travels as an argument, not as text spliced into the script.
+          ssh vps "bash -s -- $(printf '%q' "${DEPLOY_PATH%/}")" <<'REMOTE'
+          set -eo pipefail
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          set -u
+          cd "$1"
+          mkdir -p logs
+          echo "node $(node -v), npm $(npm -v)"
+
+          npm ci --omit=dev --no-audit --no-fund
+
+          # sequelize-cli is a runtime dependency, so this works without dev deps.
+          NODE_ENV=production npm run migrate -w @trial-booking/api
+
+          pm2 startOrReload ecosystem.config.cjs --update-env
+          pm2 save
+          REMOTE
+
+      - name: Health check
+        run: |
+          set -euo pipefail
+          ssh vps 'bash -s' <<'REMOTE'
+          set -o pipefail
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+
+          ready=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if body="$(curl -sf --max-time 5 http://127.0.0.1:4001/health/ready)"; then
+              ready="yes"
+              echo "API ready: ${body}"
+              break
+            fi
+            echo "attempt ${attempt}/10: API not ready yet"
+            sleep 3
+          done
+          if [ -z "${ready}" ]; then
+            echo "API did not pass /health/ready"
+            exit 1
+          fi
+
+          # The API check says nothing about the other two processes.
+          for app in trial-booking-worker trial-booking-payments-sandbox; do
+            pid="$(pm2 pid "${app}" 2>/dev/null | tail -n 1)"
+            if [ -z "${pid}" ] || [ "${pid}" = "0" ]; then
+              echo "${app} is not running"
+              exit 1
+            fi
+          done
+          pm2 status
+          REMOTE
+
+      - name: Show PM2 logs after a failure
+        if: failure() && steps.ssh.outcome == 'success'
+        run: |
+          ssh vps 'bash -s' <<'REMOTE' || true
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          pm2 status
+          for app in trial-booking-api trial-booking-worker trial-booking-payments-sandbox; do
+            pm2 logs "${app}" --lines 40 --nostream
+          done
+          REMOTE
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key ~/.ssh/config

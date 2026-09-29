@@ -1,0 +1,39 @@
+{
+	"name": "@trial-booking/shared",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./constants": {
+			"types": "./dist/constants.d.ts",
+			"import": "./dist/constants.js"
+		},
+		"./types": {
+			"types": "./dist/types.d.ts",
+			"import": "./dist/types.js"
+		},
+		"./validators": {
+			"types": "./dist/validators.d.ts",
+			"import": "./dist/validators.js"
+		}
+	},
+	"scripts": {
+		"build": "tsc",
+		"typecheck": "tsc --noEmit",
+		"test:unit": "node --import tsx --test \"src/__tests__/*.test.ts\"",
+		"clean": "rm -rf dist"
+	},
+	"dependencies": {
+		"zod": "^3.25.76"
+	},
+	"devDependencies": {
+		"tsx": "^4.23.15",
+		"typescript": "^5.9.3"
+	}
+}

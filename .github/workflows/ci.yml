@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # deploy.yml calls this workflow so a deploy only ships a commit that passed it.
+  workflow_call:
+
+# Read-only token: nothing here pushes, comments or publishes.
+permissions:
+  contents: read
+
+concurrency:
+  # When deploy.yml calls this file, github.workflow is the caller's name
+  # ("Deploy"), so the deploy's CI run and the plain CI run for the same push
+  # land in different groups and never cancel each other.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, typecheck, unit tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Third-party actions are pinned to full commit SHAs: a tag can be moved
+      # to different code, a commit cannot.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Lint prose
+        run: npm run lint:prose
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      # The deploy builds the same way; catching a broken build on the PR is cheaper.
+      - name: Build
+        run: npm run build
+
+  integration:
+    name: Integration tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # PostgreSQL comes preinstalled on ubuntu-latest but stopped, so no
+      # service container (and no Docker) is needed. The password is random per
+      # run and masked in the logs; the database is thrown away with the runner.
+      - name: Start PostgreSQL
+        run: |
+          set -euo pipefail
+          sudo systemctl start postgresql.service
+          for _ in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5432 -q && break
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p 5432
+
+          DB_PASSWORD="$(openssl rand -hex 16)"
+          echo "::add-mask::${DB_PASSWORD}"
+          sudo -u postgres psql -X -q -v ON_ERROR_STOP=1 <<SQL
+          CREATE ROLE trial_booking_ci WITH LOGIN PASSWORD '${DB_PASSWORD}';
+          CREATE DATABASE trial_booking_test OWNER trial_booking_ci;
+          CREATE DATABASE trial_booking_e2e OWNER trial_booking_ci;
+          SQL
+
+          {
+            echo "TEST_DATABASE_URL=postgres://trial_booking_ci:${DB_PASSWORD}@127.0.0.1:5432/trial_booking_test"
+            echo "E2E_DATABASE_URL=postgres://trial_booking_ci:${DB_PASSWORD}@127.0.0.1:5432/trial_booking_e2e"
+          } >> "$GITHUB_ENV"
+
+      - name: Integration tests
+        run: npm run test:integration
+
+  e2e:
+    name: End-to-end tests (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Same setup as the integration job. Jobs do not share a runner, and a
+      # local composite action would live outside .github/workflows/.
+      - name: Start PostgreSQL
+        run: |
+          set -euo pipefail
+          sudo systemctl start postgresql.service
+          for _ in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5432 -q && break
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p 5432
+
+          DB_PASSWORD="$(openssl rand -hex 16)"
+          echo "::add-mask::${DB_PASSWORD}"
+          sudo -u postgres psql -X -q -v ON_ERROR_STOP=1 <<SQL
+          CREATE ROLE trial_booking_ci WITH LOGIN PASSWORD '${DB_PASSWORD}';
+          CREATE DATABASE trial_booking_test OWNER trial_booking_ci;
+          CREATE DATABASE trial_booking_e2e OWNER trial_booking_ci;
+          SQL
+
+          {
+            echo "TEST_DATABASE_URL=postgres://trial_booking_ci:${DB_PASSWORD}@127.0.0.1:5432/trial_booking_test"
+            echo "E2E_DATABASE_URL=postgres://trial_booking_ci:${DB_PASSWORD}@127.0.0.1:5432/trial_booking_e2e"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+          if-no-files-found: ignore

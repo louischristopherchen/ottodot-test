@@ -1,9 +1,17 @@
 node_modules/
-data/
-*.db
-*.db-shm
-*.db-wal
+dist/
+logs/
+coverage/
+.pgdata/
+test-results/
+playwright-report/
 .DS_Store
+
+# Environment files hold secrets; only .env.example is committed
+.env
+.env.*
+*.env
+!.env.example
 
 # Personal notes that stay out of the repo
 *.local.md
