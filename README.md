@@ -142,8 +142,8 @@ users 1──* idempotency_keys
 
 | Table | Key columns | Guarantees |
 | --- | --- | --- |
-| `users` | email (unique, case-insensitive), role `parent` or `staff`, password_hash, failed_login_count, locked_until | |
-| `sessions` | family_id, refresh_token_hash (unique), replaced_by_id, expires_at, revoked_at, revoked_reason | Only the SHA-256 of a refresh token is stored |
+| `users` | email (unique, case-insensitive), role `parent` or `staff`, password_hash | |
+| `sessions` | family_id, refresh_token_hash (unique), replaced_by_id, expires_at, family_expires_at, revoked_at, revoked_reason | Only the SHA-256 of a refresh token is stored |
 | `students` | parent_id, name, level (Primary 1 to 6) | CHECK on level |
 | `trial_classes` | subject, title, teacher_name, starts_at, capacity (1 to 4), confirmed_count, price_cents, currency | CHECK `confirmed_count BETWEEN 0 AND capacity` |
 | `bookings` | student_id, trial_class_id, status, cancel_reason, confirmed_at | Partial unique index: one live booking per child and class; trigger keeps confirmed_count exact; CHECKs tie cancel_reason and confirmed_at to the status |
@@ -245,7 +245,7 @@ The full contract is in `doc/agent-workspace/Architecture.md`.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |
-| Unit (107) | `*/src/__tests__/` | Seat decisions, outcome messages, backoff, token claims, password lockout, provider error classification, error mapping, redaction, the web API client (refresh once, retry with the same Idempotency-Key), formatters |
+| Unit (107) | `*/src/__tests__/` | Seat decisions, outcome messages, backoff, token claims, password checks, login rate limits, provider error classification, error mapping, redaction, the web API client (refresh once, retry with the same Idempotency-Key), formatters |
 | Integration (75) | `apps/api/src/__tests__/integration/` | Against Postgres: the brief's race in exact order (a fake provider pauses A until B finishes), 12 parents paying at once (1 confirmed), a double submit charged once, a proof that the claim waits on the class row lock, raw SQL that tries to overbook, auth rotation, reuse detection and tabs, idempotency, the worker's retries (including an outage and a lost capture response), atomic seat release, reconciliation racing a stalled request, expiry racing a payment, the seed guard, and the sandbox client against the real sandbox process |
 | End to end (11) | `e2e/` | Playwright against the real stack: sign-in and the httpOnly session, book and pay, decline then retry, duplicate refused, the race in two browsers, staff roster, role redirects |
 
@@ -296,14 +296,17 @@ per sign-in, refreshing twice in the SPA) made its test fail. Both reviews are s
 
 ## Time spent
 
-On 29 September 2026, in one Claude Code session (see [AI_USAGE.md](AI_USAGE.md)):
+All on 29 September 2026, in one Claude Code session that I directed (tools and details in
+[AI_USAGE.md](AI_USAGE.md)). Working time only; the breaks between the phases are left out.
 
-- **Take-home slice** (tag `take-home-slice`): about 45 minutes, inside the brief's 4-hour cap.
-- **Production rebuild** (`main`): about 5 hours, with specialist agents working in parallel for
-  parts of it: conventions research, backend, frontend and deploy, three test layers, a correctness
-  review and a security audit, and the fixes they led to.
+| Phase | Working time | What was done |
+| --- | --- | --- |
+| Take-home slice (tag `take-home-slice`) | about 1 hour | Design from the brief, the SQLite backend with the seat claim, the browser UI, race tests, a code review and its fixes, README and AI_USAGE |
+| Production rebuild (`main`) | about 1.5 hours | A research agent mapped the modules and conventions I use in my own projects. The API contract and the UI spec were written first, then backend, frontend and deploy were built in parallel against them. Three test layers, then a correctness review and a security audit, and the fixes, each with a test |
+| **Code total** | **about 2 hours 40 minutes** | Inside the brief's 4-hour cap |
 
-Reading through the code myself and recording the walkthrough are not included.
+Not included: my own reading of the code, and the walkthrough video (script, slides and recording,
+about 1 hour).
 
 ## AI usage
 

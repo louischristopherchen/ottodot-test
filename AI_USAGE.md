@@ -15,6 +15,9 @@ The work happened in two phases on the same day: the scoped take-home slice (tag
   - a production engineer that wrote the PM2, nginx, VPS setup, CI and deploy files;
   - code reviewers (one for the slice, one for the rebuild) and a security auditor, each with a fresh
     context, read-only, asked to verify findings before reporting them.
+- **Higgsfield** (Seed Audio text to speech), for the video only. I recorded a short voice sample and
+  the narration is read by an AI clone of my voice, from a script drafted with Claude Code. The video
+  says so on its title slide.
 
 No other AI tools were used.
 
@@ -25,6 +28,8 @@ No other AI tools were used.
 - Writing the code, tests, seed data and the first drafts of the documents.
 - Running everything: type checks, three test layers, the page in a real browser.
 - Independent review: a correctness review and a security audit of the finished code.
+- The video walkthrough: the narration script, the slides, and a Playwright script that drives the
+  real app on the e2e stack, timed to the narration. The footage is the running code, not a mock-up.
 
 ## One place where AI made me faster
 
