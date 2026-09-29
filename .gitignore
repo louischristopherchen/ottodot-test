@@ -4,3 +4,6 @@ data/
 *.db-shm
 *.db-wal
 .DS_Store
+
+# Personal notes that stay out of the repo
+*.local.md
