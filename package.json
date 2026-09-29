@@ -5,7 +5,7 @@
   "description": "Trial class booking slice: book, pay (mock), confirm, roster. Handles duplicates, overbooking, payment failure and the last-seat race.",
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=24.2"
   },
   "scripts": {
     "start": "node src/server.ts",

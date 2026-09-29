@@ -100,8 +100,9 @@ export function createApp(deps: Deps): express.Express {
       res.status(error.httpStatus).json({ error: { code: error.code, message: error.message } });
       return;
     }
-    if (isJsonSyntaxError(error)) {
-      res.status(400).json({ error: { code: 'validation_error', message: 'Request body is not valid JSON.' } });
+    const clientError = asClientError(error);
+    if (clientError) {
+      res.status(clientError.status).json({ error: { code: clientError.code, message: clientError.message } });
       return;
     }
     console.error(error);
@@ -134,6 +135,16 @@ function parse<T>(schema: z.ZodType<T>, body: unknown): T {
   return result.data;
 }
 
-function isJsonSyntaxError(error: unknown): boolean {
-  return error instanceof SyntaxError && (error as { type?: string }).type === 'entity.parse.failed';
+/**
+ * Errors raised by the JSON body parser (malformed JSON, body too large,
+ * unsupported charset) carry a 4xx status and a message that is safe to show.
+ */
+function asClientError(error: unknown): { status: number; code: string; message: string } | null {
+  if (typeof error !== 'object' || error === null) return null;
+  const { status, type, expose, message } = error as { status?: unknown; type?: unknown; expose?: unknown; message?: unknown };
+  if (typeof status !== 'number' || status < 400 || status >= 500 || expose !== true) return null;
+  if (type === 'entity.parse.failed') {
+    return { status: 400, code: 'validation_error', message: 'Request body is not valid JSON.' };
+  }
+  return { status, code: 'bad_request', message: typeof message === 'string' ? message : 'Bad request.' };
 }

@@ -11,7 +11,7 @@ import type { Booking, BookingStatus, CancelReason, Deps, PaymentAttempt, Paymen
 //   pending_payment --declined-------------------------> payment_failed --retry--> (as pending_payment)
 //   pending_payment --authorized + seat claimed--------> confirmed
 //   pending_payment --class full or started------------> cancelled (class_full | booking_closed)
-//   confirmed       --capture failed (rare)------------> payment_failed (seat released)
+//   confirmed       --capture failed (rare)------------> payment_failed (seat released, hold voided)
 //
 // A booking holds a seat only while it is `confirmed`, and the only code that
 // sets `confirmed` is claimSeat(), which runs under the database write lock.
@@ -176,8 +176,7 @@ export async function payForBooking(
         { bookingId, now: deps.now().toISOString() },
       );
     });
-    const confirmedByParallelAttempt = getBooking(db, bookingId)!.status === 'confirmed';
-    return buildResult(db, bookingId, confirmedByParallelAttempt ? 'already_confirmed' : 'payment_declined', attemptId);
+    return buildResult(db, bookingId, outcomeAfterDecline, attemptId);
   }
 
   // Step 3
@@ -193,7 +192,10 @@ export async function payForBooking(
   } catch (error) {
     console.error(`Capture failed for payment attempt ${attemptId}; releasing the seat`, error);
     // The seat was claimed but the money could not be taken. Give the seat
-    // back so the roster only ever lists children whose trial is paid for.
+    // back so the roster only ever lists children whose trial is paid for,
+    // then release the hold on the card. With a real provider a capture error
+    // can be ambiguous (a timeout after the money moved), so the
+    // reconciliation job in the README re-checks capture_failed attempts.
     withWriteLock(db, () => {
       setAttemptStatus(db, attemptId, 'capture_failed', deps.now(), 'capture_failed');
       execute(
@@ -203,6 +205,7 @@ export async function payForBooking(
         { bookingId, now: deps.now().toISOString() },
       );
     });
+    await releaseAuthorization(deps, attemptId, authorization.providerRef);
     return buildResult(db, bookingId, 'payment_declined', attemptId);
   }
   withWriteLock(db, () => setAttemptStatus(db, attemptId, 'captured', deps.now()));
@@ -285,6 +288,7 @@ function cancelBooking(db: Db, bookingId: string, reason: CancelReason, now: Dat
   );
 }
 
+/** Updates an attempt's status. A failure code, once set, is kept (a capture_failed attempt that is then voided still says why). */
 function setAttemptStatus(
   db: Db,
   attemptId: string,
@@ -294,7 +298,8 @@ function setAttemptStatus(
 ): void {
   execute(
     db,
-    `UPDATE payment_attempts SET status = :status, failure_code = :failureCode, updated_at = :now
+    `UPDATE payment_attempts
+        SET status = :status, failure_code = COALESCE(:failureCode, failure_code), updated_at = :now
       WHERE id = :attemptId`,
     { attemptId, status, failureCode, now: now.toISOString() },
   );
@@ -323,15 +328,23 @@ async function releaseAuthorization(deps: Deps, attemptId: string, providerRef: 
   }
 }
 
+/** A decline leaves the booking payable, unless a parallel attempt for it settled it first. */
+function outcomeAfterDecline(booking: Booking): PaymentOutcome {
+  if (booking.status === 'confirmed') return 'already_confirmed';
+  if (booking.status === 'cancelled') return booking.cancelReason ?? 'class_full';
+  return 'payment_declined';
+}
+
 function buildResult(
   db: Db,
   bookingId: string,
-  outcome: PaymentOutcome,
+  outcome: PaymentOutcome | ((booking: Booking) => PaymentOutcome),
   attemptId: string | null,
 ): PaymentResult {
   const booking = getBooking(db, bookingId)!;
+  const resolved = typeof outcome === 'function' ? outcome(booking) : outcome;
   const paymentAttempt = booking.paymentAttempts.find((attempt) => attempt.id === attemptId) ?? null;
-  return { outcome, message: describeOutcome(outcome, booking, paymentAttempt), booking, paymentAttempt };
+  return { outcome: resolved, message: describeOutcome(resolved, booking, paymentAttempt), booking, paymentAttempt };
 }
 
 const DECLINE_REASONS: Record<string, string> = {
@@ -346,7 +359,7 @@ function describeOutcome(outcome: PaymentOutcome, booking: Booking, attempt: Pay
     case 'confirmed':
       return `Payment received. ${child} has a confirmed seat in "${booking.trialClass.title}".`;
     case 'payment_declined': {
-      if (attempt?.status === 'capture_failed') {
+      if (attempt?.failureCode === 'capture_failed') {
         return `The payment could not be completed, so ${child} is not booked. Please try again.`;
       }
       const reason = DECLINE_REASONS[attempt?.failureCode ?? ''] ?? 'card declined';

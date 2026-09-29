@@ -37,8 +37,12 @@ export function setupTestDb(options: { payments?: PaymentProvider; now?: Date } 
     deps,
     clock,
     close() {
+      // Every test also checks that no code path left a transaction open on
+      // the shared connection (for example an error thrown without a ROLLBACK).
+      const leftOpen = db.isTransaction;
       db.close();
       rmSync(dir, { recursive: true, force: true });
+      if (leftOpen) throw new Error('A transaction was left open on the connection');
     },
   };
 }

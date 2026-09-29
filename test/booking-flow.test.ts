@@ -152,11 +152,16 @@ describe('paying for a booking', () => {
     assert.deepEqual(paymentAttemptStatuses(ctx.db, booking.id), ['declined', 'captured']);
   });
 
-  test('if the capture fails after the seat was claimed, the seat is released again', async (t) => {
+  test('if the capture fails after the seat was claimed, the seat is released and the hold voided', async (t) => {
     t.mock.method(console, 'error', () => {}); // the failure is logged on purpose
+    let voids = 0;
     class CaptureFailsProvider extends MockPaymentProvider {
       override async capture(): Promise<void> {
         throw new Error('acquirer unavailable');
+      }
+      override async voidAuthorization(providerRef: string): Promise<void> {
+        voids += 1;
+        return super.voidAuthorization(providerRef);
       }
     }
     ctx.deps.payments = new CaptureFailsProvider({ latencyMs: 0 });
@@ -165,9 +170,12 @@ describe('paying for a booking', () => {
     const result = await payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_visa');
 
     assert.equal(result.outcome, 'payment_declined');
+    assert.match(result.message, /could not be completed/);
     assert.equal(result.booking.status, 'payment_failed');
     assert.equal(result.booking.confirmedAt, null);
-    assert.equal(result.paymentAttempt?.status, 'capture_failed');
+    assert.equal(result.paymentAttempt?.status, 'voided');
+    assert.equal(result.paymentAttempt?.failureCode, 'capture_failed');
+    assert.equal(voids, 1, 'the hold on the card is released, so a retry does not stack a second hold');
     assert.ok(!confirmedStudentIds(ctx.db, classes.fractions).includes(students.zara));
     assert.equal(seatsLeft(classes.fractions), 1);
   });
@@ -205,5 +213,71 @@ describe('paying for a booking', () => {
     await payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_visa'); // cancelled: booking_closed
 
     await assert.rejects(payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_visa'), { code: 'not_payable' });
+  });
+});
+
+describe('payments that overlap', () => {
+  test('the class starts while the card is being authorized: refused and the hold voided', async () => {
+    const { booking } = createBooking(ctx.deps, parents.aisha, { studentId: students.zara, trialClassId: classes.float });
+    provider.hold(booking.id);
+    const payment = payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_visa');
+    await provider.waitForAuthorization(booking.id);
+
+    ctx.clock.now = new Date(findTrialClass(ctx.db, classes.float)!.startsAt);
+    provider.release(booking.id);
+    const result = await payment;
+
+    assert.equal(result.outcome, 'booking_closed');
+    assert.equal(result.booking.cancelReason, 'booking_closed');
+    assert.equal(result.paymentAttempt?.status, 'voided');
+    assert.deepEqual(provider.calls, { authorize: 1, capture: 0, void: 1 });
+  });
+
+  test('a decline that lands after a parallel success on the same booking leaves it confirmed', async () => {
+    const { booking } = createBooking(ctx.deps, parents.aisha, { studentId: students.zara, trialClassId: classes.fractions });
+    provider.hold(booking.id, 'pm_card_declined');
+    const declined = payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_declined');
+    await provider.waitForAuthorization(booking.id, 'pm_card_declined');
+
+    const approved = await payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_visa');
+    provider.release(booking.id, 'pm_card_declined');
+    const late = await declined;
+
+    assert.equal(approved.outcome, 'confirmed');
+    assert.equal(late.outcome, 'already_confirmed');
+    assert.equal(late.booking.status, 'confirmed');
+    assert.deepEqual(paymentAttemptStatuses(ctx.db, booking.id), ['declined', 'captured']);
+  });
+
+  test('a success that lands after a parallel decline on the same booking confirms it', async () => {
+    const { booking } = createBooking(ctx.deps, parents.aisha, { studentId: students.zara, trialClassId: classes.fractions });
+    provider.hold(booking.id, 'pm_card_visa');
+    const approved = payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_visa');
+    await provider.waitForAuthorization(booking.id, 'pm_card_visa');
+
+    const declined = await payForBooking(ctx.deps, parents.aisha, booking.id, 'pm_card_declined');
+    assert.equal(declined.booking.status, 'payment_failed');
+    provider.release(booking.id, 'pm_card_visa');
+    const late = await approved;
+
+    assert.equal(late.outcome, 'confirmed');
+    assert.deepEqual(paymentAttemptStatuses(ctx.db, booking.id), ['captured', 'declined']);
+  });
+
+  test('a decline that lands after the booking was cancelled reports the cancellation, not a retry', async () => {
+    const zara = createBooking(ctx.deps, parents.aisha, { studentId: students.zara, trialClassId: classes.fractions }).booking;
+    provider.hold(zara.id, 'pm_card_declined');
+    const declined = payForBooking(ctx.deps, parents.aisha, zara.id, 'pm_card_declined');
+    await provider.waitForAuthorization(zara.id, 'pm_card_declined');
+
+    const ethan = createBooking(ctx.deps, parents.chloe, { studentId: students.ethan, trialClassId: classes.fractions }).booking;
+    await payForBooking(ctx.deps, parents.chloe, ethan.id, 'pm_card_visa'); // takes the last seat
+    await payForBooking(ctx.deps, parents.aisha, zara.id, 'pm_card_visa'); // Aisha's second tab: refused, booking cancelled
+    provider.release(zara.id, 'pm_card_declined');
+    const late = await declined;
+
+    assert.equal(late.outcome, 'class_full');
+    assert.equal(late.booking.status, 'cancelled');
+    assert.doesNotMatch(late.message, /retry/);
   });
 });

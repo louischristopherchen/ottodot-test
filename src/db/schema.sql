@@ -97,7 +97,8 @@ END;
 --   processing  -> authorized | declined
 --   authorized  -> captured   (seat claimed)
 --               |  voided     (no seat: the hold on the card is released)
---               |  capture_failed (seat released again)
+--               |  capture_failed (seat released again), then voided once
+--                  the hold is released; failure_code keeps 'capture_failed'
 CREATE TABLE IF NOT EXISTS payment_attempts (
   id             TEXT PRIMARY KEY,
   booking_id     TEXT NOT NULL REFERENCES bookings (id),

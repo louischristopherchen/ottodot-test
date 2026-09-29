@@ -151,6 +151,15 @@ describe('HTTP API', () => {
     assert.equal(malformed.status, 400);
   });
 
+  test('an oversized body is rejected with 413, not a server error', async () => {
+    const response = await call('POST', '/api/bookings', {
+      user: parents.aisha,
+      rawBody: JSON.stringify({ studentId: 'x'.repeat(20_000), trialClassId: classes.float }),
+    });
+    assert.equal(response.status, 413);
+    assert.equal(response.body.error.code, 'bad_request');
+  });
+
   test('unknown API routes return a JSON 404', async () => {
     const response = await call('GET', '/api/nope');
     assert.equal(response.status, 404);

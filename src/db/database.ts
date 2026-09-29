@@ -38,7 +38,9 @@ export function withWriteLock<T>(db: Db, work: () => T): T {
     db.exec('COMMIT');
     return result;
   } catch (error) {
-    db.exec('ROLLBACK');
+    // SQLite may already have rolled back on its own (e.g. disk full); a
+    // second ROLLBACK would throw and hide the original error.
+    if (db.isTransaction) db.exec('ROLLBACK');
     throw error;
   }
 }
